@@ -1,0 +1,22 @@
+# Base data and smoke-test environment
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install datasets transformers tqdm huggingface_hub
+deactivate
+
+# Axolotl environment: use Python 3.12, not Python 3.14.
+uv venv --python 3.12 .axolotl-venv
+source .axolotl-venv/bin/activate
+uv pip install -e './axolotl[deepspeed]'
+deactivate
+
+# Intel GPU note:
+# Create a separate .intel-venv using Intel's official XPU-enabled PyTorch
+# installation instructions for the target driver/runtime. Then verify:
+# python -c "import torch; print(torch.xpu.is_available())"
+# Run the custom trainer with: MOE_DEVICE=xpu ./run_custom_moe_smoke.sh
+
+# AMD GPU note:
+# Create a separate .amd-venv using the ROCm-compatible PyTorch installation
+# for the target ROCm version. Verify torch.version.hip and torch.cuda.is_available().
+# Run the custom trainer with: MOE_DEVICE=rocm ./run_custom_moe_smoke.sh

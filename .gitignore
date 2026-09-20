@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.axolotl-venv/
+.intel-venv/
+.amd-venv/
+
+# Local datasets and generated training data
+data/raw/
+data/packed/
+data/teacher/
+artifacts/
+last_run_prepared/
+*.jsonl
+
+# Experiment outputs and logs
+*.log
+wandb/
+benchmark-report.json
+Modelfile.eval
+
+# Local tooling
+.idea/
+.vscode/settings.json
+*.swp

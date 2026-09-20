@@ -1,0 +1,53 @@
+# Small dense training smoke test. This validates Axolotl and the data path;
+# it is not the custom QuantaWeave sparse-MoE implementation.
+base_model: Qwen/Qwen3-0.6B
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+datasets:
+  - path: ./data/smoke/tinystories.jsonl
+    type: completion
+
+output_dir: ./artifacts/outputs/quantweave-smoke-out
+sequence_len: 512
+sample_packing: false
+pad_to_sequence_len: true
+
+adapter: lora
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - v_proj
+
+val_set_size: 0.02
+eval_strategy: steps
+eval_steps: 5
+save_strategy: steps
+save_steps: 10
+save_total_limit: 1
+max_steps: 10
+
+gradient_accumulation_steps: 1
+micro_batch_size: 1
+num_epochs: 1
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 0.0001
+
+train_on_inputs: false
+group_by_length: false
+bf16: true
+fp16: false
+tf32: true
+gradient_checkpointing: true
+attn_implementation: sdpa
+
+warmup_steps: 5
+weight_decay: 0.1
+logging_steps: 1

@@ -1,0 +1,17 @@
+{
+  "model_name": "QuantaWeave-moe-xs",
+  "model_type": "quantweave_moe",
+  "mode": "moe",
+  "size": "xs",
+  "hidden_size": 64,
+  "layers": 2,
+  "ffn_size": 128,
+  "vocab_size": 7168,
+  "tied_embeddings": false,
+  "num_experts": 184,
+  "top_k": 1,
+  "inactive_experts_per_token": 183,
+  "active_expert_fraction": 0.005434782608695652,
+  "estimated_total_params": 9994240,
+  "estimated_active_params": 999424
+}
