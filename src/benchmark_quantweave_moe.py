@@ -65,6 +65,7 @@ def main() -> None:
     total_loss = 0.0
     total_tokens = 0
     total_router_aux = 0.0
+    total_dropped_routes = 0
     expert_counts = [0] * config.num_experts
     batches = 0
     routed_tokens = 0
@@ -77,6 +78,7 @@ def main() -> None:
             token_count = batch.size(0) * (batch.size(1) - 1)
             total_loss += float(outputs["loss"].item()) * token_count
             total_router_aux += float(outputs["router_aux_loss"].item())
+            total_dropped_routes += int(outputs["dropped_routes"].item())
             total_tokens += token_count
             batches += 1
             routed_tokens += batch.numel()
@@ -100,6 +102,14 @@ def main() -> None:
         "loss": mean_loss,
         "perplexity": math.exp(min(mean_loss, 20)),
         "router_aux_loss": total_router_aux / batches,
+        "dropped_routes": total_dropped_routes,
+        "dropped_route_fraction": total_dropped_routes / max(
+            1, routed_tokens * config.layers * config.top_k
+        ),
+        "capacity_factor": config.capacity_factor,
+        "min_expert_capacity": config.min_expert_capacity,
+        "drop_overflow_tokens": config.drop_overflow_tokens,
+        "overflow_policy": config.overflow_policy,
         "total_parameters": total_parameters,
         "shared_parameters_estimate": shared_parameters,
         "expert_parameters_estimate": expert_parameters,

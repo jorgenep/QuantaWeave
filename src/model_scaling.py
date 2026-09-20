@@ -20,6 +20,8 @@ class ModelSpec:
     vocab_size: int
     ffn_multiplier: float
     tied_embeddings: bool
+    capacity_factor: float = 1.25
+    min_expert_capacity: int = 4
 
     @property
     def ffn_size(self) -> int:
@@ -72,6 +74,8 @@ class ModelSpec:
             "active_expert_fraction": (
                 (self.top_k / self.num_experts) if self.mode == "moe" else 1.0
             ),
+            "capacity_factor": self.capacity_factor,
+            "min_expert_capacity": self.min_expert_capacity,
             "estimated_total_params": self.total_params,
             "estimated_active_params": self.active_params,
         }
@@ -119,6 +123,8 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int)
     parser.add_argument("--ffn-multiplier", type=float)
     parser.add_argument("--tied-embeddings", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--capacity-factor", type=float, default=1.25)
+    parser.add_argument("--min-expert-capacity", type=int, default=4)
     args = parser.parse_args()
 
     try:
@@ -132,6 +138,8 @@ def main() -> None:
             vocab_size=args.vocab_size,
             ffn_multiplier=args.ffn_multiplier,
             tied_embeddings=args.tied_embeddings,
+            capacity_factor=args.capacity_factor,
+            min_expert_capacity=args.min_expert_capacity,
         )
     except ValueError as error:
         parser.error(str(error))

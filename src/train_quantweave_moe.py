@@ -19,9 +19,7 @@ class CharacterDataset(Dataset):
             if limit is not None and line_number >= limit:
                 break
             row = json.loads(line)
-            text = row.get("teacher_text") or row.get("completion") or row.get("text")
-            if not text:
-                text = row.get("prompt", "") + row.get("response", "")
+            text = extract_text(row)
             if not text:
                 continue
             token_ids = [vocab.get(character, vocab["<unk>"]) for character in text]
@@ -39,12 +37,20 @@ class CharacterDataset(Dataset):
 def build_vocab(path: Path, vocab_size: int) -> dict[str, int]:
     counts: dict[str, int] = {}
     for line in path.open(encoding="utf-8"):
-        for character in json.loads(line)["text"]:
+        text = extract_text(json.loads(line))
+        for character in text:
             counts[character] = counts.get(character, 0) + 1
     reserved = {"<unk>": 0, "<eos>": 1}
     room = max(0, vocab_size - len(reserved))
     common_characters = sorted(counts, key=counts.get, reverse=True)[:room]
     return {**reserved, **{character: index + len(reserved) for index, character in enumerate(common_characters)}}
+
+
+def extract_text(row: dict[str, str]) -> str:
+    text = row.get("teacher_text") or row.get("completion") or row.get("text")
+    if text:
+        return text
+    return row.get("prompt", "") + row.get("response", "")
 
 
 def save_checkpoint(
@@ -73,13 +79,32 @@ def save_checkpoint(
     )
     (temporary_path / "config.json").write_text(json.dumps(model.config.__dict__, indent=2) + "\n")
     (temporary_path / "vocab.json").write_text(json.dumps(vocab, ensure_ascii=False, indent=2) + "\n")
+    previous_path = path.with_name(f".{path.name}.previous")
+    if previous_path.exists():
+        shutil.rmtree(previous_path)
     if path.exists():
-        shutil.rmtree(path)
-    temporary_path.rename(path)
+        path.rename(previous_path)
+    try:
+        temporary_path.rename(path)
+    except Exception:
+        if path.exists():
+            shutil.rmtree(path)
+        if previous_path.exists():
+            previous_path.rename(path)
+        raise
+    if previous_path.exists():
+        shutil.rmtree(previous_path)
 
 
 def load_checkpoint(path: Path, model: QuantaWeaveMoEForCausalLM, optimizer: torch.optim.Optimizer, device: torch.device) -> int:
-    checkpoint = torch.load(path / "model.pt", map_location=device, weights_only=False)
+    checkpoint_path = path / "model.pt"
+    if not checkpoint_path.exists():
+        fallback = path.with_name(f".{path.name}.previous") / "model.pt"
+        if fallback.exists():
+            checkpoint_path = fallback
+        else:
+            raise FileNotFoundError(f"no valid checkpoint found under {path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     rng_state = checkpoint.get("rng_state", {})
@@ -112,6 +137,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("artifacts/outputs/quantweave-moe-out"))
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--examples", type=int, default=10000)
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -119,6 +145,10 @@ def main() -> None:
     parser.add_argument("--ffn-size", type=int, default=128)
     parser.add_argument("--total-experts", type=int, default=184)
     parser.add_argument("--active-experts", type=int, default=1)
+    parser.add_argument("--capacity-factor", type=float, default=1.25)
+    parser.add_argument("--min-expert-capacity", type=int, default=4)
+    parser.add_argument("--drop-overflow-tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overflow-policy", choices=("drop", "residual"), default="residual")
     parser.add_argument("--vocab-size", type=int, default=7168)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument(
@@ -128,6 +158,8 @@ def main() -> None:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient-accumulation-steps must be positive")
 
     device = select_device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -149,6 +181,10 @@ def main() -> None:
         num_experts=args.total_experts,
         top_k=args.active_experts,
         max_sequence_length=args.sequence_length + 1,
+        capacity_factor=args.capacity_factor,
+        min_expert_capacity=args.min_expert_capacity,
+        drop_overflow_tokens=args.drop_overflow_tokens,
+        overflow_policy=args.overflow_policy,
     )
     model = QuantaWeaveMoEForCausalLM(config).to(device)
     if device.type in {"cuda", "xpu"}:
@@ -166,6 +202,7 @@ def main() -> None:
     if start_step >= args.steps:
         print(f"checkpoint already reached requested step {args.steps}")
         return
+    optimizer.zero_grad(set_to_none=True)
     for step in range(start_step + 1, args.steps + 1):
         try:
             batch = next(iterator)
@@ -175,11 +212,17 @@ def main() -> None:
         batch = batch.to(device)
         outputs = model(batch, labels=batch)
         loss = outputs["loss"]
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        print(f"step={step}/{args.steps} loss={loss.item():.4f} router_aux={outputs['router_aux_loss'].item():.4f}")
+        (loss / args.gradient_accumulation_steps).backward()
+        should_step = step % args.gradient_accumulation_steps == 0 or step == args.steps
+        if should_step:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        print(
+            f"step={step}/{args.steps} loss={loss.item():.4f} "
+            f"router_aux={outputs['router_aux_loss'].item():.4f} "
+            f"dropped_routes={int(outputs['dropped_routes'])}"
+        )
         if args.checkpoint_interval > 0 and step % args.checkpoint_interval == 0:
             save_checkpoint(args.checkpoint_dir, model, optimizer, step, vocab, device)
             print(f"checkpoint saved at step {step} to {args.checkpoint_dir}")

@@ -33,6 +33,7 @@ The current standalone model includes:
 - SwiGLU-style expert feed-forward networks
 - Configurable total experts and active experts
 - Top-k sparse routing
+- Configurable expert capacity and overflow handling
 - Router load-balancing loss
 - CUDA, ROCm, XPU, and CPU device selection
 - Periodic atomic checkpoints with optimizer and RNG state
@@ -161,6 +162,9 @@ Important controls:
 - `--active-experts`: number of experts selected per token
 - `--vocab-size`: vocabulary capacity
 - `--tied-embeddings`: share input and output embeddings
+- `--capacity-factor`: target routed capacity per expert; `0` disables the limit
+- `--min-expert-capacity`: minimum token slots per expert
+- `--overflow-policy`: `drop` to enforce capacity or `residual` to keep overflow on the block residual path
 
 The calculator estimates parameter counts. The final model implementation is the authority for exact counts because attention projections, biases, embeddings, and auxiliary layers affect totals.
 
@@ -195,8 +199,11 @@ MOE_SEQUENCE_LENGTH     sequence length excluding the shifted label token
 MOE_BATCH_SIZE          micro-batch size
 MOE_TOTAL_EXPERTS       stored expert count
 MOE_ACTIVE_EXPERTS      routed experts per token
+MOE_CAPACITY_FACTOR     expert capacity multiplier; 0 disables overflow limits
+MOE_MIN_EXPERT_CAPACITY minimum routed slots per expert
 MOE_CHECKPOINT_DIR      recovery checkpoint directory
 MOE_CHECKPOINT_INTERVAL save frequency in steps
+MOE_OUTPUT              final output directory; use this for parallel experiments
 ```
 
 ## Checkpoint Recovery
@@ -250,6 +257,7 @@ The report is saved as `benchmark-report.json` by default and includes:
 - Estimated active parameters per token
 - Total, active, and inactive expert counts
 - Router auxiliary loss
+- Dropped-route count and fraction from expert capacity limits
 - Minimum, maximum, and mean expert utilization
 - Training step recorded in the checkpoint
 
