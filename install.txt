@@ -14,9 +14,9 @@ deactivate
 # Create a separate .intel-venv using Intel's official XPU-enabled PyTorch
 # installation instructions for the target driver/runtime. Then verify:
 # python -c "import torch; print(torch.xpu.is_available())"
-# Run the custom trainer with: MOE_DEVICE=xpu ./run_custom_moe_smoke.sh
+# Run the custom trainer with: MOE_DEVICE=xpu ./scripts/run_quantweave_moe.sh
 
 # AMD GPU note:
 # Create a separate .amd-venv using the ROCm-compatible PyTorch installation
 # for the target ROCm version. Verify torch.version.hip and torch.cuda.is_available().
-# Run the custom trainer with: MOE_DEVICE=rocm ./run_custom_moe_smoke.sh
+# Run the custom trainer with: MOE_DEVICE=rocm ./scripts/run_quantweave_moe.sh

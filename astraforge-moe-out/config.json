@@ -1,0 +1,11 @@
+{
+  "vocab_size": 7168,
+  "hidden_size": 64,
+  "layers": 2,
+  "ffn_size": 128,
+  "num_experts": 64,
+  "top_k": 2,
+  "attention_heads": 4,
+  "max_sequence_length": 129,
+  "router_aux_loss_coef": 0.01
+}

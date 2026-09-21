@@ -7,6 +7,7 @@
 ```bash
 .axolotl-venv/bin/python -m py_compile src/*.py
 /usr/bin/bash -n scripts/*.sh
+.axolotl-venv/bin/python -m pytest -q tests
 ```
 
 For model changes, also run a short CPU smoke test and record the device, parameter count, loss, and router metrics.

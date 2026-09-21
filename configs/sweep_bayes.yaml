@@ -1,0 +1,24 @@
+# Bayesian search: a Gaussian process models the metric over the space and each new trial maximises expected improvement.
+#   python src/sweep.py --config configs/sweep_bayes.yaml --dry-run
+name: moe-bayes
+strategy: bayes
+n_trials: 16               # total budget
+bayes: {n_init: 5}         # random trials before the model takes over
+seed: 0
+base:
+  data: [data/smoke/tinystories.jsonl]
+  examples: 5000
+  sequence_length: 64
+  steps: 300
+  batch_size: 8
+  layers: 2
+  device: auto
+benchmark: {examples: 300, no_routing_stats: true}
+metric: benchmark.loss
+space:
+  hidden_size: [64, 128, 256]
+  total_experts: [8, 16, 32]
+  active_experts: [1, 2, 4]
+  capacity_factor: [1.0, 1.5, 2.0]
+  lr: {loguniform: [1.0e-4, 3.0e-3]}
+  router_aux_coef: {loguniform: [1.0e-3, 1.0e-1]}

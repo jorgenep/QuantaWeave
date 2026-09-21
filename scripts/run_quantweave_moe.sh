@@ -21,4 +21,5 @@ cd "$ROOT_DIR"
   --device "${MOE_DEVICE:-auto}" \
   --checkpoint-dir "${MOE_CHECKPOINT_DIR:-artifacts/checkpoints/quantweave-moe-checkpoint}" \
   --checkpoint-interval "${MOE_CHECKPOINT_INTERVAL:-1000}" \
-  --resume
+  --resume \
+  ${MOE_EXTRA_ARGS:-}

@@ -10,7 +10,7 @@ strict: false
 
 datasets:
   - path: ./data/packed/packed_100B_dataset
-    type: completion 
+    type:  # empty: pre-tokenized (input_ids/attention_mask/labels), see axolotl/docs/dataset-formats/tokenized.qmd
 
 dataset_prepared_path: ./artifacts/prepared/last_run_prepared
 output_dir: ./artifacts/outputs/quantweave-out

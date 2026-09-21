@@ -10,8 +10,9 @@ TOTAL_TOKENS = 100_000_000_000
 DATASETS_CONFIG = [
     {
         "name": "Code (75%)",
-        # StarCoderData is massive, native Parquet, and has no scripts. 
-        # Using the python subset here, but you can change 'python' to 'cpp', 'java', etc.
+        # StarCoderData is massive and native Parquet. The "default" config streams
+        # every language mixed together; to restrict it, pass data_dir="python" (or
+        # "cpp", "java", ...) to load_dataset below.
         "repo": "bigcode/starcoderdata",
         "config": "default", 
         "split": "train",
@@ -39,7 +40,7 @@ def compile_dataset():
         print(f"\n--- Processing {ds_info['name']} ---")
         print(f"Target Tokens: {ds_info['target_tokens']:,}")
         
-        # Load dataset in streaming mode, explicitly trusting the dataset's script
+        # Stream the dataset so nothing is downloaded up front
         dataset = load_dataset(
             ds_info["repo"], 
             ds_info["config"], 
@@ -50,7 +51,7 @@ def compile_dataset():
         current_tokens = 0
         first_row = True
         
-        # Open output file in append mode
+        # Open output file (truncates any previous run)
         with open(ds_info["output_file"], 'w', encoding='utf-8') as f:
             with tqdm(total=ds_info["target_tokens"], desc="Tokens Processed", unit="tok") as pbar:
                 for row in dataset:

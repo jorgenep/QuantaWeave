@@ -12,6 +12,8 @@
   "top_k": 1,
   "inactive_experts_per_token": 183,
   "active_expert_fraction": 0.005434782608695652,
+  "capacity_factor": 1.25,
+  "min_expert_capacity": 4,
   "estimated_total_params": 9994240,
   "estimated_active_params": 999424
 }

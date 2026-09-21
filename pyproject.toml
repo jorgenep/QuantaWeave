@@ -14,6 +14,9 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["datasets", "transformers", "tqdm", "huggingface_hub"]
+tools = ["numpy", "pyyaml", "tokenizers", "psutil"]  # BPE, packed corpora, experiment configs, hardware probing
+hf = ["transformers", "safetensors"]                 # Hugging Face teachers for cross-tokenizer distillation
+gpu = ["triton", "bitsandbytes"]                    # grouped-GEMM expert kernels, 8-bit optimizers
 dev = ["pytest", "ruff"]
 
 [tool.setuptools]

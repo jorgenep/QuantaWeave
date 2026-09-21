@@ -4,6 +4,33 @@ This document captures the most promising next-generation improvements for the Q
 
 The ideas below are intentionally practical and grounded in the project’s existing architecture. They are not abstract wishlist items; they are concrete extensions that fit naturally into the existing `src/` training pipeline and the surrounding `scripts/` + `configs/` tooling.
 
+## Implementation status
+
+Verified means covered by tests in `tests/`; anything marked "not verified" has no test that can exercise it on this machine (one RTX 4060, no Intel/AMD GPU, no `onnx` package). The sections below are the original proposals and are left unchanged.
+
+| # | Idea | Status | Where | Not done / deviations |
+|---|---|---|---|---|
+| 1 | Dynamic MoE training schedule | Implemented | `moe_schedules.py`; `--lr-decay`, `--warmup-steps`, `--plateau-patience`, `--aux-coef-end`, `--aux-adapt`, `--temperature-*` | The aux-weight controller follows *measured expert-load imbalance*. The proposal's pseudo-logic raised the weight when the aux loss was low, which points the wrong way, so it was not copied. |
+| 2 | Adaptive router load balancing | Mostly | router temperature (scheduled and adaptive), imbalance-driven aux weight | Per-expert gradient-magnitude tracking. Route confidence is measured and logged but does not drive control. |
+| 3 | Expert capacity scheduling | Mostly | `--capacity-adapt`, `--capacity-release-step` | Dynamically switching `drop` to `residual`: the two policies compute the same thing (they differ only in reporting), so switching would be cosmetic. `--capacity-release-step` (stop enforcing capacity later in training) provides the intended "preserve information later" behaviour. |
+| 4 | Curriculum training | Implemented | `data_pipeline.py`; `--curriculum rarity\|entropy\|uncommon` | Model-based difficulty ("estimated sampling risk"); sequence length as a metric (windows are fixed length). |
+| 5 | Routing visualization and diagnostics | Implemented | `routing_diagnostics.py`; `--diagnostics-dir` | Per-head views (routing is per layer, not per head); specialization is by coarse token class and by domain, not by learned vocabulary cluster. |
+| 6 | Distributed expert parallelism | Implemented, CPU-verified | `expert_parallel.py`; `--expert-parallel` | Not verified on multi-GPU NCCL/XCCL; capacity is per source rank; adaptive aux/temperature controllers are unavailable in multi-process modes. |
+| 7 | Quantization and mixed precision | Implemented | bf16/fp16 autocast with GradScaler, fp32 router, `--activation-checkpointing`, int8/int4 weight-only inference (`quantization.py`), QLoRA-style fine-tuning (`lora.py`, `finetune_quantweave_moe.py`), 8-bit AdamW via bitsandbytes (`--optimizer adamw8bit`) | Low-precision optimizer state for the main trainer (8-bit AdamW is wired into fine-tuning only); 4-bit training of the full model. |
+| 8 | Hyperparameter search | Implemented | `sweep.py`: grid, random, successive halving, Bayesian (`bayes_opt.py`, GP + expected improvement) | Multi-objective search; a Bayesian model over the successive-halving budget dimension. |
+| 9 | Evaluation and benchmarking expansion | Implemented | `benchmark_quantweave_moe.py`, `training_metrics.py` | "Throughput by device type" is one device per report; compare reports across machines. |
+| 10 | Distillation | Implemented | `distill_quantweave_moe.py`: sequence-level, logit-level from a QuantaWeave teacher, and cross-tokenizer from Hugging Face teachers (`cross_tokenizer.py`) | Cross-tokenizer supervision covers only positions where both tokenizations have a boundary; BPE students need tokens that decode to valid text one at a time. |
+| 11 | Multi-task / mixed-domain training | Implemented | `data_pipeline.py` (domains, `--domain-weights`), `--domain-specialization-coef`, per-domain routing maps | Domain-aware validation splits. |
+| 12 | Recovery and training continuity | Implemented, verified exact resume | `train_quantweave_moe.py` checkpoints, `metadata.json`, resume fingerprint | Sharded state is per rank; a checkpoint cannot be resharded onto a different world size or layout. |
+| 13 | Inference export and serving | Mostly | `export_quantweave.py`: TorchScript, int8/int4, tokenizer bundle, parity + metadata | ONNX is attempted with `--onnx` but needs the `onnx` package (not verified); no serving server. |
+| 14 | Hardware auto-detection | Mostly | `hardware.py`, `--precision auto`, `--auto-batch-size` (probes full training steps incl. optimizer state; recommends the throughput knee), empirical activation-checkpointing choice | Nothing picks the expert count automatically; `hardware.py` only suggests one. Sequence length is reported, not chosen. The kernel choice (`--moe-kernel auto`) is by dtype, not measured. |
+| 15 | Experiment manager | Implemented | `experiment_manager.py` | |
+| 16.4 | Observability stack | Implemented | per-layer entropy, utilization, drop events, plateau and first-stable-step detection, active/total parameter ratio, per-device expert time and rows (`--device-metrics`) | Routing heatmaps are recorded on rank 0 only. |
+| 17.1 | Fused MoE kernels | Partly | one vectorised sort-based dispatch, plus Triton grouped-GEMM expert kernels with grouped forward and backward (`moe_kernels.py`, `--moe-kernel`) | Not fused: router, silu-mul epilogue, and the token gather/scatter; no grouped kernels inside expert parallelism (its ranks use per-expert loops); slower than cuBLAS in fp32. |
+| 17.2 | Expert / tensor / pipeline parallelism, sharded optimizer | Implemented, CPU-verified | `expert_parallel.py`, `tensor_parallel.py`, `pipeline_parallel.py`, `sharded_optimizer.py` | Not verified on multi-GPU hardware; vocabulary-parallel embeddings; pipeline cannot combine with expert/tensor parallelism; GPipe schedule only (no 1F1B or interleaving); optimizer sharding covers optimizer state and gradients but not the parameters themselves (that would be ZeRO-3/FSDP). |
+| 17.3 | Tokenizer and dataset maturity | Mostly | byte-level BPE from scratch, memory-mapped packed corpora, pre-tokenized training | SentencePiece; streaming loaders (the memmap corpus covers the same need). |
+| 17.4 | Distributed capacity management | Partly | straggler-aware routing (`DeviceLoadTracker`: integral controller on per-rank expert time), per-rank capacity | Asynchronous expert scheduling; capacity that adapts to each device's speed. |
+
 ---
 
 ## 1. Dynamic MoE Training Schedule

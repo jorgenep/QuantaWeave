@@ -1,0 +1,36 @@
+# A tracked experiment for the experiment manager:
+#   python src/experiment_manager.py run --config configs/exp_moe_balanced.yaml
+name: moe-balanced
+description: >
+  16 experts, top-2 routing, with the adaptive controllers on: capacity grows when routes overflow, the balance loss
+  weight follows measured expert imbalance, and the router temperature starts soft and anneals to 1.
+tags: [balanced, adaptive]
+train:
+  data: [data/smoke/tinystories.jsonl]
+  examples: 20000
+  sequence_length: 128
+  steps: 2000
+  batch_size: 8
+  hidden_size: 128
+  layers: 4
+  ffn_size: 256
+  attention_heads: 4
+  total_experts: 16
+  active_experts: 2
+  lr: 0.001
+  warmup_steps: 100
+  lr_decay: cosine
+  plateau_patience: 4
+  capacity_adapt: true
+  capacity_factor: 1.25
+  capacity_max: 3.0
+  aux_adapt: true
+  temperature_start: 2.0
+  temperature_steps: 500
+  controller_interval: 50
+  curriculum: rarity
+  curriculum_steps: 500
+  device: auto
+benchmark:
+  examples: 1000
+objective: benchmark.loss

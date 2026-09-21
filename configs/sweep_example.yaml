@@ -1,0 +1,24 @@
+# Successive-halving search over expert layout and routing:
+#   python src/sweep.py --config configs/sweep_example.yaml --dry-run
+#   python src/sweep.py --config configs/sweep_example.yaml
+name: moe-layout
+strategy: halving
+n_trials: 8
+seed: 0
+halving: {eta: 2, rungs: 3}      # 8 trials at 200 steps -> best 4 at 400 -> best 2 at 800
+base:
+  data: [data/smoke/tinystories.jsonl]
+  examples: 5000
+  sequence_length: 64
+  steps: 200
+  batch_size: 8
+  layers: 2
+  device: auto
+benchmark: {examples: 300}
+metric: benchmark.loss
+space:
+  hidden_size: [64, 128]
+  total_experts: [8, 16, 32]
+  active_experts: [1, 2]
+  capacity_factor: [1.0, 1.5, 2.0]
+  lr: {loguniform: [1.0e-4, 1.0e-3]}

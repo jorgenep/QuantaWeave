@@ -18,6 +18,5 @@ jobs:
         run: bash -n scripts/*.sh
       - name: Run model tests
         run: |
-          python -m pip install torch
-          python -m pip install pytest
+          python -m pip install torch numpy pyyaml tokenizers psutil pytest
           pytest -q tests

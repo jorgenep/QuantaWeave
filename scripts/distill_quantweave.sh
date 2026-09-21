@@ -16,4 +16,7 @@ cd "$ROOT_DIR"
   --checkpoint-interval "${DISTILL_CHECKPOINT_INTERVAL:-1000}" \
   --lr "${DISTILL_LR:-0.0001}" \
   --device "${MOE_DEVICE:-auto}" \
+  ${DISTILL_TEACHER_CHECKPOINT:+--teacher-checkpoint "$DISTILL_TEACHER_CHECKPOINT"} \
+  --alpha "${DISTILL_ALPHA:-1.0}" \
+  --temperature "${DISTILL_TEMPERATURE:-2.0}" \
   --resume
