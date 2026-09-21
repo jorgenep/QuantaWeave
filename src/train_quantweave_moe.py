@@ -360,7 +360,21 @@ def load_data(args, is_main: bool):
 
 
 def run_training(args) -> dict:
-    """Train according to ``args`` (a namespace from build_parser()); returns a summary dict."""
+    """Train according to ``args`` (a namespace from build_parser()); returns a summary dict.
+
+    Run archiving borrows a few option fields (metrics file, diagnostics directory) and creates temporary files for them;
+    however the run ends, the caller's options are restored and those files are removed."""
+    original_outputs = (args.metrics_file, args.diagnostics_dir, args.diagnostics_interval)
+    temporary_paths: list[Path] = []
+    try:
+        return _run_training(args, original_outputs, temporary_paths)
+    finally:
+        args.metrics_file, args.diagnostics_dir, args.diagnostics_interval = original_outputs
+        for path in temporary_paths:
+            shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
+
+
+def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient-accumulation-steps must be positive")
     ep = pp = None
@@ -408,9 +422,7 @@ def run_training(args) -> dict:
     say = print if is_main else (lambda *a, **k: None)
 
     started = time.time()
-    original_outputs = (args.metrics_file, args.diagnostics_dir, args.diagnostics_interval)
     archiving = args.archive_dir is not None and not args.no_archive and is_main
-    temporary_paths: list[Path] = []
     if archiving:                                    # the archive needs metrics and diagnostics even if the caller did not ask for files
         if args.metrics_file is None:
             handle, name = tempfile.mkstemp(suffix=".jsonl")
@@ -709,9 +721,6 @@ def run_training(args) -> dict:
         )
         summary["archive"] = str(bundle)
         say(f"archived run to {bundle}")
-    args.metrics_file, args.diagnostics_dir, args.diagnostics_interval = original_outputs
-    for path in temporary_paths:
-        shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
     return summary
 
 

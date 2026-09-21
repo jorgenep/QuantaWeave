@@ -270,3 +270,19 @@ def test_multi_process_run_creates_exactly_one_archive_with_the_consolidated_mod
     assert (bundle / "model" / "model.pt").exists() and not (bundle / "model" / "shards").exists()
     record = json.loads((bundle / "summary.json").read_text())
     assert "held-out" in record["benchmarks"] and (bundle / "training" / "metrics.jsonl").exists()
+
+
+def test_a_failing_run_leaves_no_temporary_files_and_restores_the_callers_options(tmp_path):
+    import tempfile
+    data = corpus(tmp_path / "d.jsonl")
+    temp_root = Path(tempfile.gettempdir())
+    before = {p.name for p in temp_root.glob("diagnostics-*")} | {p.name for p in temp_root.glob("tmp*.jsonl")}
+    args = trainer.default_args(data=[data], steps=3, batch_size=2, sequence_length=16, examples=30, hidden_size=16, layers=1, ffn_size=24, total_experts=4,
+                                active_experts=2, vocab_size=64, device="cpu", checkpoint_interval=0, output=tmp_path / "o", checkpoint_dir=tmp_path / "c",
+                                archive_dir=tmp_path / "archive", curriculum="rarity")            # raises: --curriculum needs --curriculum-steps
+    with pytest.raises(ValueError, match="curriculum-steps"):
+        trainer.run_training(args)
+    after = {p.name for p in temp_root.glob("diagnostics-*")} | {p.name for p in temp_root.glob("tmp*.jsonl")}
+    assert after == before, f"leaked temporary files: {after - before}"
+    assert args.metrics_file is None and args.diagnostics_dir is None and args.diagnostics_interval == 0
+    assert not (tmp_path / "archive").exists() or not any((tmp_path / "archive").iterdir())         # no half-made archive either

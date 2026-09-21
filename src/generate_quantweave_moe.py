@@ -20,6 +20,7 @@ def sample_text(model, tokenizer, prompt: str, tokens: int, temperature: float, 
             context = torch.tensor([generated[-context_length:]], dtype=torch.long, device=device)
             with autocast_context(device, precision):
                 logits = model(context)["logits"][:, -1, :].float()
+            logits[:, tokenizer.vocab_size:] = float("-inf")        # ids the tokenizer never had are untrained noise
             probabilities = (logits / max(temperature, 0.01)).softmax(dim=-1)
             next_id = torch.multinomial(probabilities, 1).item()
             generated.append(next_id)

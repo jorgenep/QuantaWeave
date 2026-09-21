@@ -63,7 +63,8 @@ src/
   bayes_opt.py                  Gaussian-process Bayesian optimisation
   distill_quantweave_moe.py     Sequence-level and logit-level distillation
   benchmark_quantweave_moe.py   Checkpoint benchmark (JSON + Markdown)
-  generate_quantweave_moe.py    Text sampling
+  chat_quantweave_moe.py        Send messages: interactive chat, one-off, or batch test messages
+  generate_quantweave_moe.py    Text sampling (simple, one prompt)
   quantization.py               Weight-only int8 / int4 for inference
   run_bundle.py                 Per-run archive folders named by epoch time
   export_quantweave.py          Inference bundle: TorchScript, int8/int4, tokenizer, metadata
@@ -79,6 +80,7 @@ scripts/
   run_pipeline_parallel.sh      torchrun launcher: pipeline parallelism
   finetune_quantweave.sh        QLoRA fine-tuning launcher
   benchmark_quantweave.sh       Benchmark launcher
+  chat_quantweave.sh            Chat / send messages launcher
   distill_quantweave.sh         Distillation launcher
   export_quantweave.sh          Export launcher
   smoke_quantweave.sh           Bounded data and manifest smoke test
@@ -485,20 +487,26 @@ Each run gets a unique id and a directory with `config.json`, `metrics.jsonl`, `
 
 Sweeps support `grid`, `random` (lists, `loguniform`, `uniform`, `int`), `halving` (successive halving: the top 1/eta of each rung continue with eta times the steps) and `bayes`. Bayesian search (`src/bayes_opt.py`, torch only) fits a Gaussian process (Matern-5/2 kernel, hyperparameters chosen by marginal likelihood) to the trials so far and runs the point with the highest expected improvement next, after `bayes.n_init` random trials; it never proposes invalid combinations or repeats a point, and a failed trial is remembered without teaching the model a fake value. Combinations that cannot work, such as more active than total experts, are skipped and listed.
 
-## Generate A Showcase Sample
-
-After benchmarking, generate text from the saved checkpoint:
+## Send Messages To A Model
 
 ```bash
-MOE_DEVICE=xpu \
-.intel-venv/bin/python src/generate_quantweave_moe.py \
-  --checkpoint artifacts/outputs/quantweave-moe-out \
-  --prompt "Once upon a time" \
-  --tokens 300 \
-  --temperature 0.8
+./scripts/chat_quantweave.sh                         # interactive chat with the newest archived run
+python src/chat_quantweave_moe.py --checkpoint artifacts/outputs/quantweave-moe-out -m "Once upon a time" --temperature 0
+python src/chat_quantweave_moe.py --run 1789960141 --messages-file smoke.jsonl --json
+printf 'Once upon a time\nThe quick brown fox\n' | python src/chat_quantweave_moe.py --latest
 ```
 
-The generator uses the checkpoint vocabulary and model configuration, so it is suitable for a reproducible demo after each training run.
+**Which model:** `--checkpoint DIR`, `--run EPOCH` (an archived run by its epoch id or folder), `--latest` (the newest archived run with a model; fine-tune runs resolve to their merged model or base plus adapter), `--adapter DIR` (a QLoRA adapter over `--checkpoint`), and `--quantize 4|8` to try the compressed model. With none of them it uses `artifacts/outputs/quantweave-moe-out`.
+
+**Three ways to send:** run with no messages in a terminal for an interactive session; pass `-m` (repeatable), `--messages-file`, or pipe lines on stdin for one-off and batch messages; `--interactive` forces the session even from a pipe. Inside the session `/help` lists the commands: `/set temperature|top_k|top_p|tokens|seed|system VALUE`, `/mode complete|chat`, `/reset`, `/show`, `/history`, `/save FILE`, `/quit`. Invalid settings are rejected and change nothing.
+
+**Test messages.** A batch file is `.txt` (one message per line, `#` comments) or `.jsonl` with `{"message": ..., "expect": "text" or ["text", ...], "tokens": ..., "temperature": ..., "mode": ...}` per line. Every `expect` string must appear in the reply; the run prints PASS/FAIL per message and a summary, and **exits 1 if any check failed**, so it can gate a script or CI job. `--json` prints one JSON object per reply (message, prompt, response, tokens, tokens/s, stop reason, unknown characters, pass/fail); `--transcript FILE` appends every exchange to a JSONL log.
+
+**Two modes.** `complete` (default) sends the message as the start of a text and shows the continuation, which is what a base model does. `chat` wraps the conversation as `User: ... / Assistant:` turns with an optional `--system` line, keeps the history in the session, and stops when the model starts a new `User:` line. Only a model trained on dialogue answers sensibly there; a base model plays along with the format at best. The trainer has no chat-format (role-tagged, assistant-only-loss) training yet.
+
+**Sampling and reproducibility.** `--temperature 0` is greedy and fully deterministic; `--seed N` makes sampling reproducible; `--top-k`, `--top-p` and `--stop TEXT` (repeatable) are supported. Only tokens the tokenizer really has are ever sampled and `<unk>` is never produced: a character model's output range is far larger than its ~40 real characters, and the untrained rest used to appear as `?` in samples (the older `generate_quantweave_moe.py` had this too and now applies the same restriction). Characters in your message that the model never saw are replaced by `<unk>`, and the tool tells you which. There is no KV cache, so each new token re-reads the whole context (about 40 tokens/s on a 4060 for the 30M-parameter model); long generations are slow.
+
+`generate_quantweave_moe.py` remains the simple one-prompt sampler.
 
 ## Small Smoke Test
 
