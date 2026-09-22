@@ -29,11 +29,13 @@ def extract_text(row: dict[str, str]) -> str:
     return row.get("prompt", "") + row.get("response", "")
 
 
-def read_rows(paths: Sequence[Path], limit: Optional[int] = None) -> Iterator[tuple[str, str]]:
+def read_rows(paths: Sequence[Path], limit: Optional[int] = None, redactor=None) -> Iterator[tuple[str, str]]:
     """Yield (domain, text). ``limit`` caps the JSONL rows read per file.
 
     A row's domain is its "domain" field; without one it is "default" for a single input
-    file and the file stem when several files are given.
+    file and the file stem when several files are given. ``redactor``, a pii_redact.PIIRedactor, applies
+    best-effort PII redaction to every row's text before it is yielded (see pii_redact.py's docstring for
+    what it does and does not catch).
     """
     for path in paths:
         fallback = "default" if len(paths) == 1 else Path(path).stem
@@ -44,6 +46,8 @@ def read_rows(paths: Sequence[Path], limit: Optional[int] = None) -> Iterator[tu
                 row = json.loads(line)
                 text = extract_text(row)
                 if text:
+                    if redactor is not None:
+                        text = redactor.redact(text)
                     yield str(row.get("domain") or fallback), text
 
 
@@ -249,10 +253,13 @@ class TokenCorpus:
         return sum(segment.length for segment in self.segments)
 
 
-def build_corpus(paths: Sequence[Path], tokenizer, limit: Optional[int] = None) -> TokenCorpus:
-    """Tokenize JSONL rows into per-domain streams, each document followed by <eos>."""
+def build_corpus(paths: Sequence[Path], tokenizer, limit: Optional[int] = None, redactor=None) -> TokenCorpus:
+    """Tokenize JSONL rows into per-domain streams, each document followed by <eos>.
+
+    ``redactor``: an optional pii_redact.PIIRedactor applied to every row's text before tokenization.
+    """
     streams: dict[str, array] = {}
-    for domain, text in read_rows(paths, limit):
+    for domain, text in read_rows(paths, limit, redactor):
         stream = streams.setdefault(domain, array("i"))
         stream.extend(tokenizer.encode(text))
         stream.append(tokenizer.eos_id)
@@ -268,11 +275,12 @@ def build_corpus(paths: Sequence[Path], tokenizer, limit: Optional[int] = None) 
 
 
 def write_token_bin(
-    paths: Sequence[Path], tokenizer, out_dir: Path, limit: Optional[int] = None
+    paths: Sequence[Path], tokenizer, out_dir: Path, limit: Optional[int] = None, redactor=None
 ) -> dict:
     """Tokenize JSONL into a memory-mappable ``tokens.bin`` plus ``meta.json`` and the tokenizer.
 
     Rows are appended to one temporary file per domain, so memory use does not grow with the corpus.
+    ``redactor``: an optional pii_redact.PIIRedactor applied to every row's text before tokenization.
     """
     import numpy as np
 
@@ -282,7 +290,7 @@ def write_token_bin(
     handles = {}
     lengths: dict[str, int] = {}
     try:
-        for domain, text in read_rows(paths, limit):
+        for domain, text in read_rows(paths, limit, redactor):
             if domain not in handles:
                 parts[domain] = out_dir / f".tokens.{len(parts)}.part"
                 handles[domain] = parts[domain].open("wb")

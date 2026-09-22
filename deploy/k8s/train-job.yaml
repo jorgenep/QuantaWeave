@@ -1,0 +1,93 @@
+# Multi-node expert/tensor-parallel training as a native Kubernetes Indexed Job (k8s 1.24+, no operator/CRD
+# dependency — Kubeflow's training-operator PyTorchJob is the more common way to run this if your cluster already
+# has it installed; this is the plain-Job alternative for a cluster that doesn't).
+#
+# Each pod gets its rank from the Job's own JOB_COMPLETION_INDEX; pod 0's stable hostname (via the headless
+# Service below) is the rendezvous address every pod's torchrun connects to.
+#
+# NOT verified on a real cluster: this repository's own testing has one GPU and no multi-node hardware (see
+# FUTURE_IDEAS.md, README's "Current Scope"). Treat this as a documented starting point, not a validated one —
+# in particular, check that your cluster's CNI allows pod-to-pod traffic on MASTER_PORT and that your GPU device
+# plugin's resource name matches (`nvidia.com/gpu` below; ROCm/other clusters use a different key).
+#
+# Apply with: kubectl apply -f deploy/k8s/train-job.yaml
+# Watch with: kubectl logs -f quantweave-train-0 job-name=quantweave-train
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: quantweave-train
+spec:
+  clusterIP: None   # headless: gives each pod a stable DNS name (quantweave-train-<index>.quantweave-train)
+  selector:
+    job-name: quantweave-train
+  ports:
+    - port: 29500
+      name: rendezvous
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quantweave-train
+spec:
+  completionMode: Indexed
+  completions: 2      # number of nodes; change together with .spec.parallelism and NNODES below
+  parallelism: 2
+  backoffLimit: 0      # a distributed training run should not silently retry from step 0
+  template:
+    spec:
+      subdomain: quantweave-train
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: quantweave:latest   # build from this repo's Dockerfile and push it somewhere your cluster can pull from
+          resources:
+            limits:
+              nvidia.com/gpu: "4"    # GPUs per pod/node; must match --nproc_per_node below
+            requests:
+              cpu: "16"
+              memory: 64Gi
+          env:
+            - name: NNODES
+              value: "2"
+            - name: GPUS_PER_NODE
+              value: "4"
+            - name: MASTER_ADDR
+              value: "quantweave-train-0.quantweave-train"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: NODE_RANK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: MOE_TOTAL_EXPERTS
+              value: "32"
+            - name: MOE_DATA
+              value: "data/smoke/tinystories.jsonl"
+          command: ["torchrun"]
+          args:
+            - "--nnodes=$(NNODES)"
+            - "--nproc_per_node=$(GPUS_PER_NODE)"
+            - "--node_rank=$(NODE_RANK)"
+            - "--master_addr=$(MASTER_ADDR)"
+            - "--master_port=$(MASTER_PORT)"
+            - "src/train_quantweave_moe.py"
+            - "--expert-parallel"
+            - "--data"
+            - "$(MOE_DATA)"
+            - "--total-experts"
+            - "$(MOE_TOTAL_EXPERTS)"
+            - "--device"
+            - "cuda"
+            - "--output"
+            - "/app/artifacts/outputs/quantweave-moe-ep-out"
+            - "--checkpoint-dir"
+            - "/app/artifacts/checkpoints/quantweave-moe-ep-checkpoint"
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: quantweave-artifacts   # create separately: must support ReadWriteMany for multi-pod checkpointing

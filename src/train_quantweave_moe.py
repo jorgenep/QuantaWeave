@@ -19,6 +19,8 @@ from typing import Optional
 
 import torch
 
+from checkpoint_io import load_checkpoint as load_checkpoint_file
+
 from data_pipeline import (
     BatchStream,
     BPETokenizer,
@@ -133,7 +135,7 @@ def load_checkpoint(
             checkpoint_path = fallback
         else:
             raise FileNotFoundError(f"no valid checkpoint found under {path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = load_checkpoint_file(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     restore_rng(checkpoint.get("rng_state", {}), device)
@@ -284,6 +286,9 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--tokenizer-algorithm", choices=("unigram", "bpe"), default="unigram",
                       help="--tokenizer sentencepiece only: sentencepiece's own unigram or BPE algorithm")
     data.add_argument("--examples", type=int, default=10000, help="max JSONL rows read per file")
+    data.add_argument("--redact-pii", action="store_true",
+                      help="best-effort regex redaction of emails/phones/SSNs/credit cards/IPs before tokenization "
+                           "(pii_redact.py) — not a substitute for reviewing your data, see SECURITY.md")
     data.add_argument("--sequence-length", type=int, default=128)
     data.add_argument("--vocab-size", type=int, default=7168, help="character vocabulary size, or BPE size when training one")
     data.add_argument("--curriculum", choices=("none", "rarity", "entropy", "uncommon"), default="none")
@@ -389,6 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
     io.add_argument("--no-archive", action="store_true", help="do not create a run archive")
     io.add_argument("--archive-data-limit-mb", type=float, default=200.0, help="copy the training data into the archive if it is at most this big (0 = never)")
     io.add_argument("--archive-benchmark-examples", type=int, default=500, help="rows per benchmark in the archive")
+    io.add_argument("--data-card", type=Path, help="a JSON file describing this data's source/license/provenance; "
+                                                    "embedded verbatim into the archive's data manifest.json (see SECURITY.md)")
     return parser
 
 
@@ -416,10 +423,15 @@ def schedule_config_from(args) -> ScheduleConfig:
 
 
 def load_data(args, is_main: bool):
-    """Return (tokenizer, corpus)."""
+    """Return (tokenizer, corpus, redactor). ``redactor`` is None unless --redact-pii was passed."""
+    redactor = None
+    if args.redact_pii:
+        from pii_redact import PIIRedactor
+
+        redactor = PIIRedactor()
     if args.token_data:
         corpus, tokenizer = load_token_bin(args.token_data)
-        return tokenizer, corpus
+        return tokenizer, corpus, redactor
     if args.tokenizer in {"bpe", "sentencepiece"}:
         if args.tokenizer_path is None:
             raise ValueError(f"--tokenizer {args.tokenizer} needs --tokenizer-path")
@@ -427,18 +439,18 @@ def load_data(args, is_main: bool):
         if (args.tokenizer_path / marker).exists():
             tokenizer = load_tokenizer(args.tokenizer_path)
         elif args.tokenizer == "bpe":
-            tokenizer = BPETokenizer.train((text for _, text in read_rows(args.data, args.examples)), args.vocab_size)
+            tokenizer = BPETokenizer.train((text for _, text in read_rows(args.data, args.examples, redactor)), args.vocab_size)
             if is_main:
                 tokenizer.save(args.tokenizer_path)
         else:
             tokenizer = SentencePieceTokenizer.train(
-                (text for _, text in read_rows(args.data, args.examples)), args.vocab_size, args.tokenizer_algorithm
+                (text for _, text in read_rows(args.data, args.examples, redactor)), args.vocab_size, args.tokenizer_algorithm
             )
             if is_main:
                 tokenizer.save(args.tokenizer_path)
     else:
-        tokenizer = CharTokenizer.build((text for _, text in read_rows(args.data)), args.vocab_size)
-    return tokenizer, build_corpus(args.data, tokenizer, args.examples)
+        tokenizer = CharTokenizer.build((text for _, text in read_rows(args.data, redactor=redactor)), args.vocab_size)
+    return tokenizer, build_corpus(args.data, tokenizer, args.examples, redactor), redactor
 
 
 def run_training(args) -> dict:
@@ -537,7 +549,11 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    tokenizer, corpus = load_data(args, is_main)
+    tokenizer, corpus, redactor = load_data(args, is_main)
+    if redactor is not None and is_main:
+        redacted = redactor.report()
+        if any(redacted.values()):
+            say(f"PII redaction: {redacted}")
     dataset = WindowDataset(corpus, args.sequence_length)
     if len(dataset) == 0:
         raise ValueError("The corpus holds fewer tokens than one training window")
@@ -849,6 +865,7 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
             metrics_file=args.metrics_file, diagnostics_dir=args.diagnostics_dir if monitor is not None else None,
             skip_rows=None if args.token_data else args.examples, benchmark_examples=args.archive_benchmark_examples,
             device=args.device if ctx is None else "auto", precision=args.precision, data_limit_mb=args.archive_data_limit_mb,
+            data_card=args.data_card,
         )
         summary["archive"] = str(bundle)
         say(f"archived run to {bundle}")

@@ -15,6 +15,8 @@ from typing import Optional
 
 import torch
 
+from checkpoint_io import load_checkpoint
+
 from data_pipeline import WindowDataset, build_corpus, load_tokenizer
 from hardware import choose_precision, detect
 from quantweave_moe_model import QuantaWeaveConfig, QuantaWeaveMoEForCausalLM
@@ -94,7 +96,7 @@ def run_benchmark(args) -> dict:
     ]
 
     model = QuantaWeaveMoEForCausalLM(config).to(device)
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    checkpoint = load_checkpoint(model_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     precision = choose_precision(detect(device.type), args.precision)

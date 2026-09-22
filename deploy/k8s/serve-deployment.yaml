@@ -1,0 +1,84 @@
+# serve_quantweave.py behind a ClusterIP Service, fronted by whatever Ingress/LoadBalancer your cluster uses (this
+# intentionally does not terminate TLS or expose itself publicly on its own — see SECURITY.md and
+# serve_quantweave.py's own docstring: it is a single-model reference server, not a hardened edge service).
+#
+# NOT verified on a real cluster (no cluster available in this project's own testing) — a documented starting
+# point, not a validated one. Set the real API key before applying:
+#   kubectl create secret generic quantweave-api-key --from-literal=key="$(openssl rand -hex 32)"
+# Apply with: kubectl apply -f deploy/k8s/serve-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quantweave-serve
+spec:
+  replicas: 1   # each replica loads its own full copy of the model; scale only if your checkpoint volume and
+                # GPU budget support N independent copies — this is not a batching/sharded multi-replica server
+  selector:
+    matchLabels:
+      app: quantweave-serve
+  template:
+    metadata:
+      labels:
+        app: quantweave-serve
+    spec:
+      containers:
+        - name: server
+          image: quantweave:latest   # build from this repo's Dockerfile and push it somewhere your cluster can pull from
+          # serve_quantweave.py reads --api-key from the CLI, not an env var directly, and Kubernetes' `args`
+          # field does not itself run a shell to expand a Secret-sourced env var — so this runs through `sh -c`
+          # to build the command line, the standard way to thread a Secret into a CLI flag on k8s.
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              exec python3 src/serve_quantweave.py --host 0.0.0.0 --port 8000 --latest
+              --rate-limit 60 --max-queue 8 --request-timeout 30 --log-format json
+              --api-key "$MOE_API_KEY"
+          env:
+            - name: MOE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quantweave-api-key
+                  key: key
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              cpu: "4"
+              memory: 16Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+              readOnly: true
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: quantweave-artifacts
+            readOnly: true
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quantweave-serve
+spec:
+  selector:
+    app: quantweave-serve
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP

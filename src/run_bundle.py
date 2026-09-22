@@ -34,6 +34,8 @@ from typing import Iterable, Optional, Sequence
 
 import torch
 
+from checkpoint_io import load_checkpoint
+
 DEFAULT_PROMPTS = ("Once upon a time", "The ")
 PARTIAL_HASH_BYTES = 16 << 20
 FULL_HASH_LIMIT = 512 << 20
@@ -46,6 +48,8 @@ def add_archive_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--no-archive", action="store_true", help="do not create a run archive")
     group.add_argument("--archive-data-limit-mb", type=float, default=200.0, help="copy the data into the archive if it is at most this big (0 = never)")
     group.add_argument("--archive-benchmark-examples", type=int, default=500, help="rows per benchmark in the archive")
+    group.add_argument("--data-card", type=Path, help="a JSON file describing this data's source/license/provenance; "
+                                                       "embedded verbatim into the archive's data manifest.json (see SECURITY.md)")
 
 
 def resolve_archive_dir(args: argparse.Namespace, default: Path = Path("artifacts/runs")) -> None:
@@ -95,8 +99,14 @@ def _count_lines(path: Path) -> Optional[int]:
         return sum(1 for _ in handle)
 
 
-def archive_data(data_paths: Sequence[Path], bundle: Path, limit_mb: float, rows_used: Optional[int]) -> dict:
-    """Copy the training files when their total size is within ``limit_mb``; always write a manifest."""
+def archive_data(data_paths: Sequence[Path], bundle: Path, limit_mb: float, rows_used: Optional[int], data_card: Optional[Path] = None) -> dict:
+    """Copy the training files when their total size is within ``limit_mb``; always write a manifest.
+
+    ``data_card``: an optional JSON file (source, license, collection date, consent basis, whatever the user
+    provides — no fixed schema is imposed, since only the user knows what applies to their data) embedded verbatim
+    into the manifest under "data_card", so a run's provenance/licensing story travels with its archive instead of
+    living only in someone's memory. Nothing here can infer that on its own from the data itself.
+    """
     files = [Path(p) for p in data_paths if Path(p).is_file()]
     total = sum(p.stat().st_size for p in files)
     copy = bool(files) and limit_mb > 0 and total <= limit_mb * (1 << 20)
@@ -120,6 +130,11 @@ def archive_data(data_paths: Sequence[Path], bundle: Path, limit_mb: float, rows
             "data was not copied: " + ("no data files were found" if not files else f"{total / (1 << 20):.0f} MB exceeds the {limit_mb:g} MB limit")
             + "; the manifest records the sources and hashes so they can be matched to this run"),
     }
+    if data_card is not None:
+        try:
+            manifest["data_card"] = json.loads(Path(data_card).read_text())
+        except Exception as error:
+            manifest["data_card_error"] = f"could not read --data-card {data_card}: {type(error).__name__}: {error}"
     (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -202,7 +217,7 @@ def write_samples(model_dir: Path, destination: Path, prompts: Iterable[str], de
     device = select_device(device_arg)
     config = QuantaWeaveConfig(**json.loads((model_dir / "config.json").read_text()))
     model = QuantaWeaveMoEForCausalLM(config).to(device)
-    model.load_state_dict(torch.load(model_dir / "model.pt", map_location=device, weights_only=False)["model"])
+    model.load_state_dict(load_checkpoint(model_dir / "model.pt", map_location=device)["model"])
     model.eval()
     tokenizer = load_tokenizer(model_dir)
     torch.manual_seed(0)
@@ -308,6 +323,7 @@ def create_run_bundle(
     data_limit_mb: float = 200.0,
     sample_prompts: Optional[Sequence[str]] = None,
     now: Optional[float] = None,
+    data_card: Optional[Path] = None,
 ) -> Path:
     """Write the archive folder and return its path. ``model_dirs`` maps folder name -> source directory to copy."""
     warnings: list[str] = []
@@ -327,7 +343,7 @@ def create_run_bundle(
     for name, source in model_dirs.items():
         attempt(f"copy {name}", lambda name=name, source=source: shutil.copytree(
             source, bundle / name, ignore=shutil.ignore_patterns("shards", ".*.tmp", ".*.previous")))
-    manifest = attempt("archive data", lambda: archive_data(data_paths, bundle, data_limit_mb, skip_rows))
+    manifest = attempt("archive data", lambda: archive_data(data_paths, bundle, data_limit_mb, skip_rows, data_card))
     if manifest and not manifest["copied"] and manifest["note"]:
         warnings.append(manifest["note"])
 

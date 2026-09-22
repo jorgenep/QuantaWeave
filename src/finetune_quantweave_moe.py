@@ -19,6 +19,8 @@ from typing import Optional
 
 import torch
 
+from checkpoint_io import load_checkpoint
+
 from data_pipeline import BatchStream, WindowDataset, build_corpus, load_tokenizer
 from hardware import choose_precision, detect
 from run_bundle import add_archive_arguments, create_run_bundle, reproduce_command, resolve_archive_dir
@@ -31,7 +33,7 @@ from train_quantweave_moe import autocast_context, build_optimizer, select_devic
 def load_base(checkpoint: Path, device: torch.device) -> QuantaWeaveMoEForCausalLM:
     config = QuantaWeaveConfig(**json.loads((checkpoint / "config.json").read_text()))
     model = QuantaWeaveMoEForCausalLM(config)
-    model.load_state_dict(torch.load(checkpoint / "model.pt", map_location="cpu", weights_only=False)["model"])
+    model.load_state_dict(load_checkpoint(checkpoint / "model.pt", map_location="cpu")["model"])
     return model.to(device)
 
 
@@ -165,7 +167,7 @@ def run_finetune(args) -> dict:
             summary={**metadata, "final_loss": metadata["loss_after"], "steps": args.steps}, started=started_at, finished=finished,
             reproduce=reproduce_command("finetune_quantweave_moe.py", build_parser(), args, skip=("archive_dir", "no_archive")),
             skip_rows=args.examples, benchmark_examples=args.archive_benchmark_examples, device=args.device, precision=args.precision,
-            data_limit_mb=args.archive_data_limit_mb,
+            data_limit_mb=args.archive_data_limit_mb, data_card=args.data_card,
         )
         metadata["archive"] = str(bundle)
         print(f"archived run to {bundle}")

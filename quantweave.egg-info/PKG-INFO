@@ -1,3 +1,41 @@
+Metadata-Version: 2.4
+Name: quantweave
+Version: 0.1.0
+Summary: Configurable dense and sparse Mixture-of-Experts language-model framework
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.1
+Provides-Extra: data
+Requires-Dist: datasets; extra == "data"
+Requires-Dist: transformers; extra == "data"
+Requires-Dist: tqdm; extra == "data"
+Requires-Dist: huggingface_hub; extra == "data"
+Provides-Extra: tools
+Requires-Dist: numpy; extra == "tools"
+Requires-Dist: pyyaml; extra == "tools"
+Requires-Dist: tokenizers; extra == "tools"
+Requires-Dist: sentencepiece; extra == "tools"
+Requires-Dist: psutil; extra == "tools"
+Provides-Extra: hf
+Requires-Dist: transformers; extra == "hf"
+Requires-Dist: safetensors; extra == "hf"
+Provides-Extra: gpu
+Requires-Dist: triton; extra == "gpu"
+Requires-Dist: bitsandbytes; extra == "gpu"
+Provides-Extra: export
+Requires-Dist: onnx; extra == "export"
+Requires-Dist: onnxruntime; extra == "export"
+Provides-Extra: serve
+Requires-Dist: fastapi; extra == "serve"
+Requires-Dist: uvicorn; extra == "serve"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Provides-Extra: all
+Requires-Dist: quantweave[data,dev,export,hf,serve,tools]; extra == "all"
+Dynamic: license-file
+
 # QuantaWeave
 
 QuantaWeave is a configurable language-model research framework for experimenting with dense and sparse Mixture-of-Experts (MoE) causal language models. It is designed to run small local experiments and scale toward distributed training on NVIDIA CUDA, AMD ROCm, or Intel XPU hardware.
@@ -54,8 +92,6 @@ src/
   training_metrics.py           Metrics log, plateau and stability detection
   data_pipeline.py              Tokenizers (BPE, SentencePiece, char), token corpora, memmap, curriculum,
                                  domain sampling, BatchStream, domain-stratified train/val split
-  pii_redact.py                 Best-effort regex PII redaction (--redact-pii)
-  checkpoint_io.py               Centralized checkpoint loading — the one place weights_only=False is used and documented
   prepare_tokens.py             Train a BPE or SentencePiece tokenizer / pack a memory-mapped token corpus
   hardware.py                   Device detection, precision choice, safe batch-size probe, auto-architecture
   expert_parallel.py            Expert + tensor parallelism, straggler-aware routing and capacity, sharded
@@ -117,14 +153,6 @@ artifacts/
   experiments/                  Tracked experiment runs
   exports/                      Inference bundles
   prepared/                     Axolotl prepared datasets
-
-deploy/
-  slurm/train_multi_node.sbatch  Multi-node training via srun + torchrun (unverified — see Production Deployment)
-  k8s/train-job.yaml             Multi-node training as a plain Kubernetes Indexed Job (unverified)
-  k8s/serve-deployment.yaml      serve_quantweave.py behind a Deployment + Service, hardening flags on (unverified)
-
-Dockerfile, .dockerignore         CUDA container image (see Production Deployment; not built in this project's own testing)
-SECURITY.md                      Checkpoint trust boundary, serving/training-data risks — read before deploying
 
 axolotl/                         Existing Axolotl checkout
 .venv/                           Lightweight data/smoke environment
@@ -531,32 +559,7 @@ curl -s localhost:8000/chat -d '{"messages": [{"role": "user", "content": "hi"}]
 curl -N localhost:8000/generate/stream -d '{"prompt": "Once upon a time", "tokens": 200}'   # text/event-stream
 ```
 
-`src/serve_quantweave.py` is a FastAPI/uvicorn HTTP server around the same KV-cache/CUDA-graph decoder the chat tool uses (`chat_quantweave_moe.py`/`fast_decode.py`), so a request behaves exactly like the equivalent `chat_quantweave_moe.py` call. One model, one process: the decoder's KV cache is mutable per-request state, so concurrent requests are serialized behind an `asyncio.Lock` (generation runs in a worker thread so the event loop still accepts and queues requests while one runs). Routes: `/health`, `/metrics`, `/generate`, `/chat`, `/generate/stream` (Server-Sent Events). This is a single-model reference server, not a batching/multi-tenant inference engine.
-
-**Hardening (all opt-in, off by default — read SECURITY.md before deploying this anywhere real):**
-
-```bash
-python src/serve_quantweave.py --latest --host 0.0.0.0 \
-  --api-key "$MOE_API_KEY" --rate-limit 60 --max-queue 8 --request-timeout 30 \
-  --moderation-blocklist moderation/blocklist.txt --log-format json
-```
-
-- `--api-key KEY`: requires `Authorization: Bearer KEY` or `X-API-Key: KEY` on every route but `/health`
-- `--rate-limit N [--rate-limit-window SECONDS]`: 429s past N requests per window, per API key or client IP
-- `--max-queue N` / `--request-timeout SECONDS`: backpressure for "one slow request starves every other caller" — `max-queue` rejects new requests with 429 once N are already waiting to start, `request-timeout` gives up waiting and returns 503 after that many seconds. Neither cancels a generation already in progress (Python can't forcibly stop a blocking computation in a worker thread, and the decode loop has no cooperative cancellation point) — they bound how long *other* callers wait behind it, not how long the slow request itself runs; see the module docstring for the exact scope
-- `--moderation-blocklist FILE`: a regex per line, checked against the prompt (or the last chat message); a match is rejected with 422. A basic keyword guardrail, not a safety or alignment solution — this is a from-scratch base-model pipeline with no RLHF/instruction-alignment step
-- `--log-format json`: one structured JSON line per request (route, status, latency, request id) instead of plain text, for log aggregators
-- `/metrics`: Prometheus text-exposition counters (requests, errors, latency, tokens generated), gated by `--api-key` too when one is set
-
-## Production Deployment
-
-Read **[SECURITY.md](SECURITY.md)** first — checkpoint loading's trust boundary, what the HTTP server does and does not protect against, and training-data handling.
-
-- **Containerization**: `Dockerfile` (CUDA base image; swap the base and the torch install line for ROCm/XPU/CPU — see "Device Backends" above) and `.dockerignore`. Not built/run in this project's own testing (no Docker available here) — verify it builds on your machine before relying on it.
-- **Multi-node training**: `deploy/slurm/train_multi_node.sbatch` (Slurm, `srun` + `torchrun`'s `c10d` rendezvous) and `deploy/k8s/train-job.yaml` (a plain Kubernetes Indexed Job, no operator/CRD dependency). Neither is verified on a real cluster — this project's own testing has one GPU and no multi-node hardware (see "Current Scope" below) — treat them as documented starting points.
-- **Serving**: `deploy/k8s/serve-deployment.yaml` — a Deployment + Service around `serve_quantweave.py` with the hardening flags above turned on, readiness/liveness probes against `/health`, and an API key threaded in from a Secret. Also unverified on a real cluster.
-- **Training data governance**: `--redact-pii` (best-effort regex redaction of emails/phones/SSNs/credit cards/IPs before tokenization — `src/pii_redact.py`, not a substitute for reviewing your data) on `train_quantweave_moe.py` and `prepare_tokens.py`; `--data-card FILE` (a JSON file describing your data's source/license/provenance, with no fixed schema — embedded verbatim into the run archive's `data/manifest.json` alongside the existing per-file hashes and row counts) on the trainer, `finetune_quantweave_moe.py` and `distill_quantweave_moe.py`.
-- **Quality gate before promotion**: `experiment_manager.py` configs can set a `promotion_threshold` alongside `objective` — a run only gets `"promotable": true` in `best.json` when its objective value is at or below the threshold, so "best run attempted so far" and "good enough to deploy" aren't silently conflated when every attempt is still bad.
+`src/serve_quantweave.py` is a FastAPI/uvicorn HTTP server around the same KV-cache/CUDA-graph decoder the chat tool uses (`chat_quantweave_moe.py`/`fast_decode.py`), so a request behaves exactly like the equivalent `chat_quantweave_moe.py` call. One model, one process: the decoder's KV cache is mutable per-request state, so concurrent requests are serialized behind an `asyncio.Lock` (generation runs in a worker thread so the event loop still accepts and queues requests while one runs). Routes: `/health`, `/generate`, `/chat`, `/generate/stream` (Server-Sent Events). This is a single-model reference server, not a batching/multi-tenant inference engine, and has no auth beyond what you put in front of it (a reverse proxy).
 
 ## Quantized Fine-Tuning (QLoRA)
 
@@ -657,5 +660,3 @@ DeepSpeed ZeRO-3 partitions memory but does not create expert routing. FlashAtte
 ## Current Scope
 
 The standalone implementation is a research and scaling framework, not a production trillion-parameter training system. `FUTURE_IDEAS.md` tracks which of the roadmap ideas are implemented and which are not. Still open: multi-GPU validation of the parallel modes (they are verified on CPU processes only), vocabulary-parallel embeddings, combining pipeline with expert/tensor parallelism, asynchronous expert scheduling, and fused kernels beyond the grouped-GEMM expert path (for example a fused router or attention kernel).
-
-The production-hardening pieces under "Production Deployment" above (Dockerfile, the Slurm/Kubernetes templates under `deploy/`) are the same kind of "written carefully, not verified on real infrastructure" as the multi-GPU parallel modes — this repository's own testing has one GPU, no cluster, and no Docker daemon. Read them as a starting point and verify each one on your own infrastructure, not as something already proven to work.

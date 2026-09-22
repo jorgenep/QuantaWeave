@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from checkpoint_io import load_checkpoint
+
 from data_pipeline import load_tokenizer
 from quantweave_moe_model import QuantaWeaveConfig, QuantaWeaveMoEForCausalLM
 from train_quantweave_moe import autocast_context, select_device
@@ -43,7 +45,7 @@ def main() -> None:
     tokenizer = load_tokenizer(args.checkpoint)
     device = select_device(args.device)
     model = QuantaWeaveMoEForCausalLM(config).to(device)
-    model.load_state_dict(torch.load(args.checkpoint / "model.pt", map_location=device, weights_only=False)["model"])
+    model.load_state_dict(load_checkpoint(args.checkpoint / "model.pt", map_location=device)["model"])
     model.eval()
     print(sample_text(model, tokenizer, args.prompt, args.tokens, args.temperature, device, args.precision))
 

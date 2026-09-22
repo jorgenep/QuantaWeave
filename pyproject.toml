@@ -14,10 +14,13 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["datasets", "transformers", "tqdm", "huggingface_hub"]
-tools = ["numpy", "pyyaml", "tokenizers", "psutil"]  # BPE, packed corpora, experiment configs, hardware probing
+tools = ["numpy", "pyyaml", "tokenizers", "sentencepiece", "psutil"]  # BPE/SentencePiece, packed corpora, experiment configs, hardware probing
 hf = ["transformers", "safetensors"]                 # Hugging Face teachers for cross-tokenizer distillation
 gpu = ["triton", "bitsandbytes"]                    # grouped-GEMM expert kernels, 8-bit optimizers
+export = ["onnx", "onnxruntime"]                    # ONNX export and its round-trip self-verification
+serve = ["fastapi", "uvicorn"]                      # the HTTP inference server (serve_quantweave.py)
 dev = ["pytest", "ruff"]
+all = ["quantweave[data,tools,hf,export,serve,dev]"]  # everything exercised by the test suite except gpu (needs CUDA)
 
 [tool.setuptools]
 py-modules = []

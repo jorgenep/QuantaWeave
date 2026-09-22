@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+from checkpoint_io import load_checkpoint as load_checkpoint_file
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -49,7 +51,7 @@ def distillation_loss(student_logits: Tensor, teacher_logits: Tensor, temperatur
 def load_model(checkpoint: Path, device: torch.device) -> tuple[QuantaWeaveMoEForCausalLM, object]:
     config = QuantaWeaveConfig(**json.loads((checkpoint / "config.json").read_text()))
     model = QuantaWeaveMoEForCausalLM(config).to(device)
-    state = torch.load(checkpoint / "model.pt", map_location=device, weights_only=False)["model"]
+    state = load_checkpoint_file(checkpoint / "model.pt", map_location=device)["model"]
     model.load_state_dict(state)
     return model, load_tokenizer(checkpoint)
 
@@ -131,7 +133,7 @@ def run_distillation(args) -> dict:
         print(f"resumed distillation from step {start_step}")
     else:
         # Fine-tune the student: start from its trained weights, with a fresh optimizer.
-        state = torch.load(args.student / "model.pt", map_location=device, weights_only=False)["model"]
+        state = load_checkpoint_file(args.student / "model.pt", map_location=device)["model"]
         model.load_state_dict(state)
         print(f"initialised from student weights at {args.student / 'model.pt'}")
 
@@ -179,7 +181,7 @@ def run_distillation(args) -> dict:
             options=vars(args), summary={**result, "final_loss": result.get("loss")}, started=started, finished=finished,
             reproduce=reproduce_command("distill_quantweave_moe.py", build_parser(), args, skip=("archive_dir", "no_archive")),
             skip_rows=args.examples, benchmark_examples=args.archive_benchmark_examples, device=args.device, precision=args.precision,
-            data_limit_mb=args.archive_data_limit_mb,
+            data_limit_mb=args.archive_data_limit_mb, data_card=args.data_card,
         )
         result["archive"] = str(bundle)
         print(f"archived run to {bundle}")

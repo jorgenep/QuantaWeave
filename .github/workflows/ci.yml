@@ -12,11 +12,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
       - name: Compile Python sources
         run: python -m py_compile src/*.py
       - name: Check shell scripts
         run: bash -n scripts/*.sh
-      - name: Run model tests
+      - name: Install torch (CPU) and the project with every non-GPU extra
+        # The `gpu` extra (triton, bitsandbytes) needs a CUDA device to be useful; this runner has none, and the
+        # tests that need them are already skipped (via skipif/importorskip) on a CUDA-less machine, so installing
+        # them here would only slow the job down without adding coverage. Every other extra IS installed, so the
+        # suite exercises SentencePiece, ONNX export, and the HTTP server here too, not only on a developer's own
+        # machine — a narrower install list here previously let those tests silently no-op via importorskip.
         run: |
-          python -m pip install torch numpy pyyaml tokenizers psutil pytest
-          pytest -q tests
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[data,tools,hf,export,serve,dev]"
+      - name: Run model tests
+        run: pytest -q -rs tests

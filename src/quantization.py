@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+from checkpoint_io import load_checkpoint
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -108,7 +110,7 @@ def save_quantized(model: QuantaWeaveMoEForCausalLM, path: Path, stats: dict, qu
 
 
 def load_quantized(path: Path, device: torch.device = torch.device("cpu")) -> QuantaWeaveMoEForCausalLM:
-    payload = torch.load(path, map_location=device, weights_only=False)
+    payload = load_checkpoint(path, map_location=device)
     model = QuantaWeaveMoEForCausalLM(QuantaWeaveConfig(**payload["config"]))
     quantize_model(model, payload["bits"], payload["group_size"], payload["quantize_lm_head"])
     model.load_state_dict(payload["state_dict"])

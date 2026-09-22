@@ -87,17 +87,29 @@ def objective_of(summary: dict, objective: Optional[str]) -> tuple[str, Optional
     return name, float(value) if isinstance(value, (int, float)) else None
 
 
-def update_best(runs_dir: Path, summary: dict, objective: Optional[str]) -> bool:
-    """Record ``summary`` as the best run if it beats the current best on the same objective."""
+def update_best(runs_dir: Path, summary: dict, objective: Optional[str], promotion_threshold: Optional[float] = None) -> bool:
+    """Record ``summary`` as the best run if it beats the current best on the same objective.
+
+    ``promotion_threshold``, if set, gates the ``promotable`` field it writes into best.json: a run's value must be
+    at or below the threshold (the objective is assumed lower-is-better, e.g. loss or perplexity) to be marked
+    promotable, regardless of whether it is numerically the best run seen so far. Without a threshold every
+    recorded best is promotable, matching the previous behaviour. This exists so "best run so far" and "good
+    enough to deploy" are not silently conflated: a best.json that is merely the least-bad of several failing runs
+    is recorded as such, not presented as ready to serve.
+    """
     name, value = objective_of(summary, objective)
     if value is None:
         return False
+    promotable = True if promotion_threshold is None else value <= promotion_threshold
     best_path = runs_dir / "best.json"
     if best_path.exists():
         best = json.loads(best_path.read_text())
         if best.get("objective") == name and best["value"] <= value:
             return False
-    best_path.write_text(json.dumps({"run_id": summary["run_id"], "objective": name, "value": value, "path": summary["run_dir"]}, indent=2) + "\n")
+    best_path.write_text(json.dumps({
+        "run_id": summary["run_id"], "objective": name, "value": value, "path": summary["run_dir"],
+        "promotable": promotable, "promotion_threshold": promotion_threshold,
+    }, indent=2) + "\n")
     return True
 
 
@@ -147,7 +159,7 @@ def run_experiment(config: dict, runs_dir: Path = DEFAULT_RUNS_DIR, name: Option
     summary["seconds"] = time.perf_counter() - started
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
     if summary["status"] == "completed":
-        summary["is_best"] = update_best(runs_dir, summary, config.get("objective"))
+        summary["is_best"] = update_best(runs_dir, summary, config.get("objective"), config.get("promotion_threshold"))
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
     (run_dir / "report.md").write_text(render_run_report(resolved, summary))
     return summary

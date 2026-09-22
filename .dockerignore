@@ -1,0 +1,25 @@
+# Keep the build context small and avoid baking local state into the image (see Dockerfile's VOLUME comment).
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+.axolotl-venv/
+.intel-venv/
+.amd-venv/
+
+data/
+artifacts/
+last_run_prepared/
+*.jsonl
+*.log
+wandb/
+benchmark-report.json
+Modelfile.eval
+
+.idea/
+.vscode/
+.git/
+.github/

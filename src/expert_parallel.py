@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+from checkpoint_io import load_checkpoint
 import torch.distributed as dist
 from torch import Tensor
 
@@ -420,7 +422,7 @@ def load_sharded_checkpoint(directory, model, optimizer, ctx, extra_out: Optiona
     weights-only checkpoint."""
     from train_quantweave_moe import restore_rng
 
-    checkpoint = torch.load(shard_path(directory, ctx.global_rank), map_location=ctx.device, weights_only=False)
+    checkpoint = load_checkpoint(shard_path(directory, ctx.global_rank), map_location=ctx.device)
     if checkpoint["world_size"] != ctx.global_size or checkpoint.get("layout", ctx.layout()) != ctx.layout():
         raise ValueError(f"checkpoint was written with layout {checkpoint.get('layout')} on {checkpoint['world_size']} ranks "
                          f"but this run is {ctx.layout()} on {ctx.global_size}")
@@ -478,7 +480,7 @@ def reshard_checkpoint(checkpoint_dir, output_dir, ep_size: int, tp_size: int = 
             raise ValueError(f"attention_heads {config['attention_heads']} must be divisible by tp_size {tp_size}")
         if config["ffn_size"] % tp_size:
             raise ValueError(f"ffn_size {config['ffn_size']} must be divisible by tp_size {tp_size}")
-    checkpoint = torch.load(checkpoint_dir / "model.pt", map_location="cpu", weights_only=False)
+    checkpoint = load_checkpoint(checkpoint_dir / "model.pt", map_location="cpu")
     state = checkpoint["model"]
     per_rank = config["num_experts"] // ep_size
 
@@ -517,7 +519,7 @@ def consolidate_checkpoint(shards_dir, output_dir) -> None:
     Weights only: optimizer state stays in the shards."""
     shards, rank = [], 0
     while shard_path(shards_dir, rank).exists():
-        shards.append(torch.load(shard_path(shards_dir, rank), map_location="cpu", weights_only=False))
+        shards.append(load_checkpoint(shard_path(shards_dir, rank), map_location="cpu"))
         rank += 1
     if not shards:
         raise FileNotFoundError(f"no shards under {shards_dir}")

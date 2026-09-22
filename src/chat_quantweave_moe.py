@@ -37,6 +37,8 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
+from checkpoint_io import load_checkpoint
+
 from data_pipeline import load_tokenizer
 from fast_decode import FastDecoder, Unsupported, filter_logits
 from hardware import choose_precision, detect
@@ -238,7 +240,7 @@ def load_for_chat(checkpoint: Path, adapter: Optional[Path], quantize: int, devi
     else:
         config = QuantaWeaveConfig(**json.loads((checkpoint / "config.json").read_text()))
         model = QuantaWeaveMoEForCausalLM(config).to(device)
-        model.load_state_dict(torch.load(checkpoint / "model.pt", map_location=device, weights_only=False)["model"])
+        model.load_state_dict(load_checkpoint(checkpoint / "model.pt", map_location=device)["model"])
         if quantize:
             from quantization import quantize_model
 

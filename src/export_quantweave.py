@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+from checkpoint_io import load_checkpoint
 from torch import nn
 
 from data_pipeline import load_tokenizer
@@ -44,7 +46,7 @@ def sha256(path: Path) -> str:
 
 def load_checkpoint_model(checkpoint: Path) -> tuple[QuantaWeaveMoEForCausalLM, dict]:
     config = QuantaWeaveConfig(**json.loads((checkpoint / "config.json").read_text()))
-    state = torch.load(checkpoint / "model.pt", map_location="cpu", weights_only=False)
+    state = load_checkpoint(checkpoint / "model.pt", map_location="cpu")
     model = QuantaWeaveMoEForCausalLM(config)
     model.load_state_dict(state["model"])
     return model.eval(), state

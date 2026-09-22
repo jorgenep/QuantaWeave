@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+from checkpoint_io import load_checkpoint
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -91,7 +93,7 @@ def save_adapter(model, path: Path, info: dict, base_checkpoint: Optional[str] =
 
 
 def load_adapter(model, path: Path) -> dict:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = load_checkpoint(path, map_location="cpu")
     parameters = dict(model.named_parameters())
     missing = set(payload["state"]) - set(parameters)
     if missing:
