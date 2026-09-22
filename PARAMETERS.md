@@ -340,6 +340,67 @@ For a model whose `training_state_bytes` would need, say, 4 GPUs' worth of memor
 (with `--total-experts` divisible by 4) is the first thing to reach for, since expert storage is usually what
 dominates.
 
+## System RAM and CPU offloading: can I train bigger than my VRAM by using RAM too?
+
+**Update: the standalone trainer now has a CPU-offload path.** `--optimizer adamw_cpu_offload`
+(`src/cpu_offload_optimizer.py`) keeps AdamW's two moments (`exp_avg`, `exp_avg_sq` — 8 of the 16
+bytes/parameter in [training state](#1-training-state--exact-and-independent-of-batch-size)) in pinned system RAM
+instead of device memory, freeing that much VRAM for a bigger model or batch. Weights and gradients stay on the
+device as usual — this offloads optimizer *state* only, the same scope as DeepSpeed's `offload_optimizer` with
+`offload_param: none` (see below). It is verified step-for-step against `torch.optim.AdamW` on identical gradients
+(max diff ~1e-7, fp32 rounding only) and end-to-end through the real trainer, including checkpoint save/resume.
+
+It is not free: every optimizer step now copies each parameter's gradient to a pinned CPU staging buffer, runs the
+AdamW update there, and copies the result back — a real host↔device transfer per step, not just a memory trick.
+Expect a real wall-clock cost, worse on a slower PCIe link or with a model large enough that the transfer dominates
+the step. Not combinable with `--shard-optimizer` (which offloads differently, across ranks rather than across
+device/host) or `--optimizer adamw8bit` (bitsandbytes' 8-bit moments already live in VRAM; the two approaches are
+alternatives, not additive).
+
+**Before this**, the situation was: no CPU-offload code path (checked directly: nothing in `src/*.py` moved
+weights, gradients, or optimizer state to CPU during training), so system RAM was used for the data loader and
+general process overhead only, not for `training_state_bytes`. The "32 GB" row in the
+[presets](#suggested-presets-by-vram) and [dense presets](#dense-model-presets-by-vram) tables still assumes that
+(the whole VRAM budget, no RAM offload) since it's the safe default; `--optimizer adamw_cpu_offload` is how you go
+beyond it deliberately, at the transfer-time cost above.
+
+**The Axolotl integration path is different, and this repo already has it half set up.**
+`configs/deepspeed_zero3.json` enables DeepSpeed ZeRO-3 with **optimizer-state offload to CPU**:
+
+```json
+"offload_optimizer": { "device": "cpu", "pin_memory": true },
+"offload_param": { "device": "none" }
+```
+
+Recall from [training state](#1-training-state--exact-and-independent-of-batch-size) that the 16 bytes/parameter
+splits into 4 (weight) + 4 (grad) + 4 + 4 (AdamW's two moments). `offload_optimizer: cpu` moves those last 8
+bytes/parameter — half the total — into pinned system RAM, freeing that much GPU memory for a bigger model or
+batch. Setting `offload_param.device` to `"cpu"` as well (it's currently `"none"`, so weights stay on GPU) would
+offload the remaining 4 bytes/parameter of weights too, for up to 12 of the 16 bytes/parameter living in RAM instead
+of VRAM.
+
+**What that would mean for your 32 GB + 32 GB machine, honestly:** I don't have that hardware to test this on, so
+take this as how ZeRO-3 offload generally behaves, not a number specific to this repo. Don't expect a clean 32 + 32
+= 64 GB budget:
+
+- **System RAM isn't 100% available.** The OS, the training process itself, and ZeRO-3's pinned-memory buffers
+  (needed for fast host↔device transfer, and pinned memory itself isn't swappable) all eat into the 32 GB before any
+  of it is free for offloaded state. Plan for meaningfully less than the full 32 GB being usable.
+- **It costs real speed, not just capacity.** Every optimizer step now moves the offloaded state over PCIe.
+  Depending on how much you offload and your PCIe generation/lane count, this ranges from a moderate slowdown to
+  the dominant cost of each step — this is standard, well-documented DeepSpeed ZeRO-Offload behavior, and worth
+  benchmarking on your own hardware before committing a long run to it.
+- **This path fine-tunes an existing pretrained dense checkpoint (Qwen)** via Axolotl (see the README's "Axolotl
+  Baseline" section), not the from-scratch QuantaWeave MoE architecture the tables above are sized for. There's no
+  preset table for it here, because sizing it is governed by DeepSpeed's own tuning (`auto` fields in the JSON, plus
+  `stage3_max_live_parameters` etc.), not this repo's `hardware.py`.
+
+For the **standalone QuantaWeave MoE trainer**, `--optimizer adamw_cpu_offload` (above) is that feature: AdamW's
+moments live in pinned host memory, with each step's gradient and update crossing PCIe to get there and back. It
+offloads less than the Axolotl/DeepSpeed ZeRO-3 path can (only the two AdamW moments, not weights or gradients too,
+and there's no equivalent of `offload_param: cpu`), so the same "don't expect a clean sum of the two budgets"
+caution above still applies — plan for real speed cost and less than the nominal extra headroom.
+
 ## Output / archiving parameters
 
 `--output`, `--checkpoint-dir`, `--checkpoint-interval`, `--resume`, `--allow-config-change`, `--metrics-file`,

@@ -2,7 +2,7 @@
 
 `run_training(args)` is the library entry point (used by the sweep and experiment manager);
 `main()` parses the command line and calls it. Multi-process modes are launched with torchrun:
---expert-parallel [--tensor-parallel T] [--shard-optimizer] [--straggler-routing], or --pipeline-parallel.
+--expert-parallel [--tensor-parallel T] [--shard-optimizer] [--straggler-routing] [--straggler-capacity], or --pipeline-parallel.
 """
 
 import argparse
@@ -35,6 +35,7 @@ from data_pipeline import (
     parse_domain_weights,
     read_rows,
     token_classes,
+    SentencePieceTokenizer,
 )
 from hardware import choose_precision, detect, find_safe_batch_size, parameter_counts
 from moe_schedules import ScheduleConfig, TrainingController
@@ -176,6 +177,52 @@ def autocast_context(device: torch.device, precision: str = "auto"):
     return torch.autocast(device.type, dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
 
 
+@torch.no_grad()
+def evaluate_validation(model, val_stream: "BatchStream", device: torch.device, precision: str, start_step: int,
+                        batches: int, num_domains: int) -> float:
+    """Mean loss over ``batches`` batches of the validation split, deterministic given val_stream's seed.
+
+    Uses a disjoint slice of steps (offset far past any plausible training step count) so it never draws the
+    same windows as an earlier validation pass at a different training step, and never touches the training
+    RNG stream. The model's mode is restored on the way out.
+    """
+    was_training = model.training
+    model.eval()
+    total, count = 0.0, 0
+    try:
+        for offset in range(batches):
+            batch, domain_ids = val_stream.batch(start_step * 100_000 + offset)
+            batch, domain_ids = batch.to(device), domain_ids.to(device)
+            with autocast_context(device, precision):
+                outputs = model(batch, labels=batch, domain_ids=domain_ids, num_domains=num_domains)
+            total += float(outputs["loss"].item())
+            count += 1
+    finally:
+        model.train(was_training)
+    return total / max(1, count)
+
+
+def build_optimizer(kind: str, parameters, lr: float):
+    """A plain AdamW, (CUDA only, needs bitsandbytes) an 8-bit AdamW whose moments are stored in 8 bits, or an
+    AdamW whose moments live in pinned CPU memory instead of device memory (see cpu_offload_optimizer.py)."""
+    parameters = list(parameters)
+    if kind == "adamw":
+        return torch.optim.AdamW(parameters, lr=lr)
+    if kind == "adamw8bit":
+        try:
+            import bitsandbytes as bnb
+        except ImportError as error:
+            raise RuntimeError("--optimizer adamw8bit needs the bitsandbytes package") from error
+        if not torch.cuda.is_available():
+            raise RuntimeError("--optimizer adamw8bit needs a CUDA device")
+        return bnb.optim.AdamW8bit(parameters, lr=lr)
+    if kind == "adamw_cpu_offload":
+        from cpu_offload_optimizer import CPUOffloadAdamW
+
+        return CPUOffloadAdamW(parameters, lr=lr)
+    raise ValueError("optimizer must be adamw, adamw8bit or adamw_cpu_offload")
+
+
 def checkpoint_exists(path: Path) -> bool:
     """True if a completed checkpoint, or the previous one left by an interrupted save, exists."""
     previous_path = path.with_name(f".{path.name}.previous")
@@ -183,7 +230,12 @@ def checkpoint_exists(path: Path) -> bool:
 
 
 def tokenizer_hash(tokenizer) -> str:
-    text = json.dumps(tokenizer.vocab, sort_keys=True) if isinstance(tokenizer, CharTokenizer) else tokenizer.tokenizer.to_str()
+    if isinstance(tokenizer, CharTokenizer):
+        text = json.dumps(tokenizer.vocab, sort_keys=True)
+    elif tokenizer.kind == "sentencepiece":
+        text = tokenizer.processor.serialized_model_proto().hex()
+    else:
+        text = tokenizer.tokenizer.to_str()
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
@@ -205,7 +257,7 @@ def resume_fields(args, config: QuantaWeaveConfig, dataset: WindowDataset, token
         tokenizer_hash=tokenizer_hash(tokenizer),
         curriculum=[args.curriculum, args.curriculum_steps, args.curriculum_start_fraction],
         domain_weights=[args.domain_weights, args.domain_weights_end, args.domain_weights_steps],
-        parallel=[bool(args.expert_parallel), args.tensor_parallel, bool(args.pipeline_parallel), args.microbatches, bool(args.shard_optimizer)],
+        parallel=[bool(args.expert_parallel), args.tensor_parallel, bool(args.pipeline_parallel), args.microbatches, bool(args.shard_optimizer), args.pipeline_schedule],
     )
     return fields
 
@@ -227,8 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     data = parser.add_argument_group("data")
     data.add_argument("--data", type=Path, nargs="+", default=[Path("data/smoke/tinystories.jsonl")])
     data.add_argument("--token-data", type=Path, help="packed corpus directory from prepare_tokens.py (replaces --data)")
-    data.add_argument("--tokenizer", choices=("char", "bpe"), default="char")
-    data.add_argument("--tokenizer-path", type=Path, help="BPE tokenizer directory; trained from --data if missing")
+    data.add_argument("--tokenizer", choices=("char", "bpe", "sentencepiece"), default="char")
+    data.add_argument("--tokenizer-path", type=Path, help="BPE/SentencePiece tokenizer directory; trained from --data if missing")
+    data.add_argument("--tokenizer-algorithm", choices=("unigram", "bpe"), default="unigram",
+                      help="--tokenizer sentencepiece only: sentencepiece's own unigram or BPE algorithm")
     data.add_argument("--examples", type=int, default=10000, help="max JSONL rows read per file")
     data.add_argument("--sequence-length", type=int, default=128)
     data.add_argument("--vocab-size", type=int, default=7168, help="character vocabulary size, or BPE size when training one")
@@ -240,8 +294,19 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--domain-weights-steps", type=int, default=0)
     data.add_argument("--domain-specialization-coef", type=float, default=0.0,
                       help="> 0 penalises domains that share experts; < 0 rewards sharing")
+    data.add_argument("--val-fraction", type=float, help="hold out this fraction of each domain's windows for validation (domain-stratified)")
+    data.add_argument("--val-interval", type=int, default=200, help="--val-fraction only: steps between validation passes")
+    data.add_argument("--val-batches", type=int, default=8, help="--val-fraction only: batches averaged per validation pass")
+    data.add_argument("--val-seed", type=int, default=0, help="--val-fraction only: which windows are held out")
 
     model = parser.add_argument_group("model")
+    model.add_argument("--auto-architecture", action="store_true",
+                       help="pick --hidden-size/--layers/--ffn-size/--attention-heads/--total-experts/--active-experts/"
+                            "--sequence-length for the training device instead of taking them explicitly (see hardware.py)")
+    model.add_argument("--auto-architecture-quality", choices=("capacity", "balanced", "dense"), default="balanced",
+                       help="--auto-architecture only: favour stored capacity, a balance, or a dense (single-expert) model")
+    model.add_argument("--auto-architecture-memory-fraction", type=float, default=0.45,
+                       help="--auto-architecture only: share of device memory to target")
     model.add_argument("--hidden-size", type=int, default=64)
     model.add_argument("--layers", type=int, default=2)
     model.add_argument("--ffn-size", type=int, default=128)
@@ -276,6 +341,10 @@ def build_parser() -> argparse.ArgumentParser:
     optim.add_argument("--temperature-steps", type=int, default=0)
     optim.add_argument("--temperature-adapt", action="store_true", help="raise router temperature when experts go unused")
     optim.add_argument("--controller-interval", type=int, default=50)
+    optim.add_argument("--optimizer", choices=("adamw", "adamw8bit", "adamw_cpu_offload"), default="adamw",
+                       help="adamw8bit (needs bitsandbytes + CUDA) keeps AdamW's moments in 8 bits instead of fp32; "
+                            "adamw_cpu_offload keeps them in pinned system RAM instead of device memory, at the cost "
+                            "of a host<->device transfer every step; neither is combinable with --shard-optimizer")
 
     system = parser.add_argument_group("system")
     system.add_argument("--device", choices=("auto", "cuda", "rocm", "xpu", "cpu"), default="auto")
@@ -288,8 +357,14 @@ def build_parser() -> argparse.ArgumentParser:
     system.add_argument("--tensor-parallel", type=int, default=1, help="split attention and expert FFNs across T ranks (combines with expert parallelism)")
     system.add_argument("--pipeline-parallel", action="store_true", help="split layers across ranks in pipeline stages (launch with torchrun)")
     system.add_argument("--microbatches", type=int, default=1, help="micro-batches per step for --pipeline-parallel (must divide --batch-size)")
+    system.add_argument("--pipeline-schedule", choices=("gpipe", "1f1b"), default="gpipe",
+                        help="gpipe: all forwards then all backwards (O(microbatches) activation memory); "
+                             "1f1b: interleave, same bubble but O(stages) activation memory")
     system.add_argument("--shard-optimizer", action="store_true", help="ZeRO-style: keep each replicated parameter's optimizer state on one rank")
     system.add_argument("--straggler-routing", action="store_true", help="bias routers away from slow or overloaded expert-parallel ranks")
+    system.add_argument("--straggler-capacity", action="store_true", help="also grow/shrink each rank's MoE token capacity to match its measured speed")
+    system.add_argument("--straggler-capacity-min", type=float, default=0.5, help="with --straggler-capacity, the smallest allowed capacity multiplier")
+    system.add_argument("--straggler-capacity-max", type=float, default=2.0, help="with --straggler-capacity, the largest allowed capacity multiplier")
     system.add_argument("--straggler-strength", type=float, default=0.5)
     system.add_argument("--straggler-max-bias", type=float, default=2.0)
     system.add_argument("--straggler-interval", type=int, default=10)
@@ -345,13 +420,20 @@ def load_data(args, is_main: bool):
     if args.token_data:
         corpus, tokenizer = load_token_bin(args.token_data)
         return tokenizer, corpus
-    if args.tokenizer == "bpe":
+    if args.tokenizer in {"bpe", "sentencepiece"}:
         if args.tokenizer_path is None:
-            raise ValueError("--tokenizer bpe needs --tokenizer-path")
-        if (args.tokenizer_path / "tokenizer.json").exists():
+            raise ValueError(f"--tokenizer {args.tokenizer} needs --tokenizer-path")
+        marker = "tokenizer.json" if args.tokenizer == "bpe" else "tokenizer.model"
+        if (args.tokenizer_path / marker).exists():
             tokenizer = load_tokenizer(args.tokenizer_path)
-        else:
+        elif args.tokenizer == "bpe":
             tokenizer = BPETokenizer.train((text for _, text in read_rows(args.data, args.examples)), args.vocab_size)
+            if is_main:
+                tokenizer.save(args.tokenizer_path)
+        else:
+            tokenizer = SentencePieceTokenizer.train(
+                (text for _, text in read_rows(args.data, args.examples)), args.vocab_size, args.tokenizer_algorithm
+            )
             if is_main:
                 tokenizer.save(args.tokenizer_path)
     else:
@@ -384,8 +466,8 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     use_expert_parallel = args.expert_parallel or tensor_parallel > 1
     if use_expert_parallel and args.pipeline_parallel:
         raise ValueError("--pipeline-parallel cannot be combined with --expert-parallel/--tensor-parallel")
-    if (args.shard_optimizer or args.straggler_routing or args.device_metrics) and not use_expert_parallel:
-        raise ValueError("--shard-optimizer, --straggler-routing and --device-metrics need --expert-parallel (or --tensor-parallel)")
+    if (args.shard_optimizer or args.straggler_routing or args.straggler_capacity or args.device_metrics) and not use_expert_parallel:
+        raise ValueError("--shard-optimizer, --straggler-routing, --straggler-capacity and --device-metrics need --expert-parallel (or --tensor-parallel)")
     if use_expert_parallel or args.pipeline_parallel:
         if args.auto_batch_size:
             raise ValueError("--auto-batch-size is not supported with multi-process parallelism")
@@ -406,6 +488,8 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
             raise ValueError("--pipeline-parallel micro-batches replace gradient accumulation; leave --gradient-accumulation-steps at 1")
         if args.domain_specialization_coef or args.diagnostics_interval or args.diagnostics_dir:
             raise ValueError("routing diagnostics and the domain loss need every layer on one rank and are not supported with --pipeline-parallel")
+        if args.val_fraction is not None:
+            raise ValueError("--val-fraction needs a full forward pass and is not supported with --pipeline-parallel")
         if args.batch_size % args.microbatches:
             raise ValueError(f"--microbatches {args.microbatches} must divide --batch-size {args.batch_size}")
         pp = init_pipeline_parallel(args.device, args.layers)
@@ -436,13 +520,33 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     reproduce_args = argparse.Namespace(**vars(args))    # what the user asked for, before defaults are resolved below
     reproduce_args.metrics_file, reproduce_args.diagnostics_dir, reproduce_args.diagnostics_interval = original_outputs
 
+    if args.auto_architecture:
+        from hardware import auto_architecture as _auto_architecture
+
+        shape = _auto_architecture(detect(device.type), args.vocab_size, args.auto_architecture_memory_fraction, args.auto_architecture_quality)
+        args.hidden_size, args.layers, args.ffn_size = shape["hidden_size"], shape["layers"], shape["ffn_size"]
+        args.attention_heads = shape["attention_heads"]
+        args.total_experts, args.active_experts = shape["total_experts"], shape["active_experts"]
+        args.sequence_length = shape["sequence_length"]
+        say(f"auto architecture ({args.auto_architecture_quality}): hidden={shape['hidden_size']} layers={shape['layers']} "
+            f"ffn={shape['ffn_size']} heads={shape['attention_heads']} experts={shape['total_experts']}/{shape['active_experts']} "
+            f"sequence_length={shape['sequence_length']} ({shape['training_state_fraction_of_budget']:.0%} of the {args.auto_architecture_memory_fraction:.0%} memory target)")
+        reproduce_args.auto_architecture = False
+        for name in ("hidden_size", "layers", "ffn_size", "attention_heads", "total_experts", "active_experts", "sequence_length"):
+            setattr(reproduce_args, name, getattr(args, name))
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     tokenizer, corpus = load_data(args, is_main)
     dataset = WindowDataset(corpus, args.sequence_length)
     if len(dataset) == 0:
         raise ValueError("The corpus holds fewer tokens than one training window")
-    vocab_size = tokenizer.vocab_size if tokenizer.kind == "bpe" else max(args.vocab_size, tokenizer.vocab_size)
+    val_dataset = None
+    if args.val_fraction is not None:
+        dataset, val_dataset = dataset.split_train_val(args.val_fraction, args.val_seed)
+        say(f"validation split: {len(val_dataset)} windows held out ({args.val_fraction:.1%} of each domain), {len(dataset)} left for training")
+    # trained subword tokenizers (bpe/sentencepiece) have a fixed vocab; only the open-ended char tokenizer needs headroom
+    vocab_size = tokenizer.vocab_size if tokenizer.kind in ("bpe", "sentencepiece") else max(args.vocab_size, tokenizer.vocab_size)
     config = QuantaWeaveConfig(
         vocab_size=vocab_size,
         hidden_size=args.hidden_size,
@@ -500,19 +604,26 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
         )
     stream = BatchStream(dataset, args.batch_size, args.seed, scores, curriculum, mixture, rank, world_size)
     domains_active = stream.num_domains > 1
+    val_stream = None
+    if val_dataset is not None:
+        val_stream = BatchStream(val_dataset, args.batch_size, args.val_seed, rank=rank, world_size=world_size)
 
     if ep is not None and args.shard_optimizer:
+        if args.optimizer != "adamw":
+            raise ValueError(f"--optimizer {args.optimizer} is not combinable with --shard-optimizer")
         from sharded_optimizer import ShardedAdamW
 
         optimizer = ShardedAdamW(model, ep, lr=args.lr)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        optimizer = build_optimizer(args.optimizer, model.parameters(), args.lr)
     tracker = None
-    if ep is not None and ep.world_size > 1 and (args.straggler_routing or args.device_metrics):
+    if ep is not None and ep.world_size > 1 and (args.straggler_routing or args.straggler_capacity or args.device_metrics):
         from expert_parallel import DeviceLoadTracker
 
         tracker = DeviceLoadTracker(model, ep, strength=args.straggler_strength if args.straggler_routing else 0.0,
-                                    max_bias=args.straggler_max_bias, interval=args.straggler_interval)
+                                    max_bias=args.straggler_max_bias, interval=args.straggler_interval,
+                                    adapt_capacity=args.straggler_capacity,
+                                    capacity_scale_min=args.straggler_capacity_min, capacity_scale_max=args.straggler_capacity_max)
     if args.simulate_slow_rank:
         slow_rank, cost = args.simulate_slow_rank.split(":")
         if ep is not None and ep.rank == int(slow_rank):
@@ -522,7 +633,7 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     if pp is not None:
         from pipeline_parallel import PipelineEngine
 
-        engine = PipelineEngine(model, pp, args.microbatches, autocast)
+        engine = PipelineEngine(model, pp, args.microbatches, autocast, schedule=args.pipeline_schedule)
     counts = parameter_counts(config)
     controller = TrainingController(schedule_config_from(args), base_temperature=args.router_temperature)
     adaptive = args.aux_adapt or args.temperature_adapt
@@ -604,11 +715,15 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     window_metrics = {"imbalance": None, "active_fraction": None}
     pending_tokens = 0
     last_log: dict = {}
+    val_loss = best_val_loss = None
     for step in range(start_step + 1, args.steps + 1):
         applied = controller.apply(model, optimizer, step)
         batch, domain_ids = stream.batch(step)
         batch, domain_ids = batch.to(device), domain_ids.to(device)
-        collect = monitor is not None and step % diagnostics_interval == 0
+        # Synchronized across ranks (depends only on diagnostics_interval/step, identical under torchrun), not on
+        # `monitor is not None` (main rank only) — collect_stats must turn on everywhere so gather_expert_utilization,
+        # a collective all_gather below, finds a populated last_stats["expert_load"] on every rank, not just main.
+        collect = bool(diagnostics_interval) and step % diagnostics_interval == 0
         model.set_collect_stats(collect)
         grad_norm = None
         if engine is not None:
@@ -657,7 +772,14 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
         controller.observe(loss_value, overflow_fraction)
         pending_tokens += args.batch_size * args.sequence_length * world_size
 
-        if collect:
+        # gather_expert_utilization is a collective (all_gather), so it must run on every rank in lockstep; `collect`
+        # is now synchronized (see above), so gating on it here is safe.
+        if tracker is not None and collect:
+            per_device_utilization = tracker.gather_expert_utilization()
+            if monitor is not None:
+                monitor.record_device_utilization(per_device_utilization)
+
+        if collect and monitor is not None:
             monitor.update(model, batch, domain_ids)
             window_metrics = {"imbalance": monitor.imbalance(), "active_fraction": monitor.active_fraction()}
             monitor.snapshot(step)
@@ -667,6 +789,13 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
                 say(f"controller step={step}: {changes}")
             window_metrics = {"imbalance": None, "active_fraction": None}
 
+        fresh_val_loss = None
+        if val_stream is not None and (step % args.val_interval == 0 or step == args.steps):
+            val_loss = fresh_val_loss = evaluate_validation(model, val_stream, device, precision, step, args.val_batches,
+                                                             val_stream.num_domains if domains_active else 0)
+            best_val_loss = val_loss if best_val_loss is None else min(best_val_loss, val_loss)
+            say(f"step={step}/{args.steps} val_loss={val_loss:.4f}")
+
         if step % args.log_interval == 0 or step == args.steps:
             last_log = logger.log(
                 step, pending_tokens, loss=loss_value, router_aux=aux_value,
@@ -674,6 +803,7 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
                 overflow_fraction=overflow_fraction, domain_loss=domain_value,
                 grad_norm=float(grad_norm) if grad_norm is not None else None, **applied,
                 **({"time_imbalance": device_metrics["time_imbalance"], "rows_imbalance": device_metrics["rows_imbalance"]} if device_metrics else {}),
+                **({"val_loss": fresh_val_loss} if fresh_val_loss is not None else {}),
             )
             pending_tokens = 0
             say(
@@ -701,7 +831,8 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
     summary.update(
         steps=args.steps, output=str(args.output), precision=precision, controller_history=controller.history,
         last_routing=monitor.snapshots[-1] if monitor is not None and monitor.snapshots else None,
-        stream=stream.state(args.steps), last_log=last_log,
+        stream=stream.state(args.steps), last_log=last_log, val_loss=val_loss, best_val_loss=best_val_loss,
+        val_windows=len(val_dataset) if val_dataset is not None else None,
     )
     if archiving:
         from run_bundle import create_run_bundle, reproduce_command

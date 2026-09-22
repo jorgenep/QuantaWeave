@@ -1,6 +1,7 @@
 """Train a tokenizer and/or pack JSONL text into a memory-mapped token corpus.
 
   python src/prepare_tokens.py bpe  --data a.jsonl --vocab-size 4096 --output artifacts/tokenizers/bpe4k
+  python src/prepare_tokens.py sentencepiece --data a.jsonl --vocab-size 4096 --output artifacts/tokenizers/sp4k
   python src/prepare_tokens.py pack --data a.jsonl b.jsonl --tokenizer artifacts/tokenizers/bpe4k \\
         --output data/tokens/mixed
   python src/prepare_tokens.py pack --data a.jsonl --tokenizer char --vocab-size 7168 --output data/tokens/chars
@@ -12,7 +13,7 @@ import argparse
 import json
 from pathlib import Path
 
-from data_pipeline import CharTokenizer, BPETokenizer, load_tokenizer, read_rows, write_token_bin
+from data_pipeline import CharTokenizer, BPETokenizer, SentencePieceTokenizer, load_tokenizer, read_rows, write_token_bin
 
 
 def main() -> None:
@@ -24,6 +25,13 @@ def main() -> None:
     bpe.add_argument("--vocab-size", type=int, default=4096)
     bpe.add_argument("--examples", type=int, help="max JSONL rows read per file")
     bpe.add_argument("--output", type=Path, required=True)
+
+    sp = commands.add_parser("sentencepiece", help="train a sentencepiece (unigram or BPE) tokenizer")
+    sp.add_argument("--data", type=Path, nargs="+", required=True)
+    sp.add_argument("--vocab-size", type=int, default=4096)
+    sp.add_argument("--algorithm", choices=("unigram", "bpe"), default="unigram")
+    sp.add_argument("--examples", type=int, help="max JSONL rows read per file")
+    sp.add_argument("--output", type=Path, required=True)
 
     pack = commands.add_parser("pack", help="tokenize JSONL into tokens.bin + meta.json")
     pack.add_argument("--data", type=Path, nargs="+", required=True)
@@ -38,6 +46,11 @@ def main() -> None:
         tokenizer = BPETokenizer.train(texts(), args.vocab_size)
         tokenizer.save(args.output)
         print(f"trained BPE tokenizer with {tokenizer.vocab_size} tokens -> {args.output}")
+        return
+    if args.command == "sentencepiece":
+        tokenizer = SentencePieceTokenizer.train(texts(), args.vocab_size, args.algorithm)
+        tokenizer.save(args.output)
+        print(f"trained sentencepiece ({args.algorithm}) tokenizer with {tokenizer.vocab_size} tokens -> {args.output}")
         return
 
     tokenizer = CharTokenizer.build(texts(), args.vocab_size) if args.tokenizer == "char" else load_tokenizer(Path(args.tokenizer))

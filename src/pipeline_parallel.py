@@ -12,13 +12,25 @@ One step, for M micro-batches of the batch:
 The router balance loss of every layer joins the loss on the stage that owns it, weighted so the total equals the
 single-device loss (mean over all layers). Gradients accumulate across micro-batches, scaled by 1/M.
 
-This is the GPipe schedule: all forwards, then all backwards. It has the usual pipeline bubble and holds M micro-batches of
-activations per stage (use --activation-checkpointing to trade compute for that memory). Expert capacity is applied per
-micro-batch. Not combinable with expert/tensor parallelism. Tested with CPU (Gloo) processes.
+This is the GPipe schedule by default: all forwards, then all backwards. It has the usual pipeline bubble and holds
+M micro-batches of activations per stage (use --activation-checkpointing to trade compute for that memory). Expert
+capacity is applied per micro-batch. Not combinable with expert/tensor parallelism. Tested with CPU (Gloo)
+processes.
+
+``schedule="1f1b"`` (``--pipeline-schedule 1f1b``) switches to the standard non-interleaved 1F1B ("PipeDream-flush")
+schedule instead: the pipeline bubble ratio is the same as GPipe's, but peak activation memory drops from O(M) to
+roughly O(S) (the number of stages), since a micro-batch's backward runs as soon as its gradient is available
+rather than only after every micro-batch has finished its forward. Each stage independently computes a warm-up
+count ``min(M, S - stage - 1)`` forwards, then alternates one forward with one backward (of the oldest still-
+pending micro-batch) until every forward has been issued, then drains the remaining backwards — the textbook
+schedule (used by Megatron-LM and PipeDream), proven not to deadlock as long as every stage follows it. It computes
+exactly the same gradients as GPipe (same sends/receives, just reordered in time), up to floating-point summation
+order, which is why it is verified against GPipe's own output rather than an independent reference.
 """
 
 import contextlib
 import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -94,72 +106,127 @@ def init_pipeline_parallel(device_arg: str, total_layers: int) -> PipelineContex
 
 
 class PipelineEngine:
-    def __init__(self, model, ctx: PipelineContext, microbatches: int, autocast: Callable = contextlib.nullcontext) -> None:
+    def __init__(
+        self, model, ctx: PipelineContext, microbatches: int, autocast: Callable = contextlib.nullcontext,
+        schedule: str = "gpipe",
+    ) -> None:
         if microbatches < 1:
             raise ValueError("microbatches must be positive")
         if model.pipeline is not ctx and model.pipeline != ctx:
             raise ValueError("the model was not built for this pipeline stage")
-        self.model, self.ctx, self.microbatches, self.autocast = model, ctx, microbatches, autocast
+        if schedule not in ("gpipe", "1f1b"):
+            raise ValueError("schedule must be gpipe or 1f1b")
+        self.model, self.ctx, self.microbatches, self.autocast, self.schedule = model, ctx, microbatches, autocast, schedule
+        self._totals = {"ce": 0.0, "aux": 0.0, "dropped": 0, "overflow": 0}
+        self._pending_sends: list = []   # [(request, tensor)] kept alive until _drain_sends(); see _isend's docstring
+
+    def _isend(self, tensor: Tensor, dst: int) -> None:
+        """Non-blocking send, waited on at the end of the step (_drain_sends), not here.
+
+        1F1B interleaves forward (downstream) and backward (upstream) traffic, so two adjacent stages can each be
+        mid-send to the other at the same time with neither having posted its matching recv yet. A blocking
+        ``dist.send`` deadlocks in exactly that situation (verified: reproduced live with a 2-stage, 4-microbatch
+        1F1B run before this fix). ``isend`` returns immediately regardless of the peer's state, so this rank can
+        keep making progress (in particular, reach the ``recv`` that unblocks the peer) instead of blocking on a
+        send the peer isn't ready for yet; GPipe's strictly one-direction-per-phase traffic was never at risk of
+        this, but uses the same helper for consistency and because there is no downside to it here.
+        """
+        request = dist.isend(tensor, dst=dst)
+        self._pending_sends.append((request, tensor))   # tensor kept alive so isend's buffer stays valid until wait()
+
+    def _drain_sends(self) -> None:
+        for request, _ in self._pending_sends:
+            request.wait()
+        self._pending_sends = []
+
+    def _forward_step(self, batch: Tensor, index: int, size: int) -> tuple:
+        """Run one micro-batch's forward pass; returns the (hidden_in, output, aux_term) tuple its backward needs."""
+        model, ctx, M = self.model, self.ctx, self.microbatches
+        width = model.config.hidden_size
+        coef = model.router_aux_loss_coef
+        total_layers = model.config.layers
+        tokens = batch[index * size : (index + 1) * size].to(ctx.device)
+        hidden_in = None
+        if ctx.is_first:
+            with self.autocast():
+                hidden = model.embed(tokens)
+        else:
+            hidden_in = torch.empty(size, tokens.size(1), width, dtype=torch.float32, device=ctx.device)
+            dist.recv(hidden_in, src=ctx.stage - 1)
+            hidden_in.requires_grad_(True)
+            hidden = hidden_in
+        with self.autocast():
+            hidden, balance, dropped, overflow, _ = model.run_blocks(hidden)
+        aux = torch.stack(balance).sum()
+        aux_term = coef * aux / total_layers / M
+        self._totals["aux"] += float(aux.detach()) / M
+        self._totals["dropped"] += int(torch.stack(dropped).sum())
+        self._totals["overflow"] += int(torch.stack(overflow).sum())
+        if ctx.is_last:
+            with self.autocast():
+                logits = model.head(hidden)
+            cross_entropy = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)).float(), tokens[:, 1:].reshape(-1))
+            loss = cross_entropy / M + aux_term
+            self._totals["ce"] += float(cross_entropy.detach()) / M
+            return (hidden_in, loss, None)
+        self._isend(hidden.detach().float().contiguous(), dst=ctx.stage + 1)
+        return (hidden_in, hidden, aux_term)
+
+    def _backward_step(self, saved: tuple) -> None:
+        """Run one micro-batch's backward pass from its saved forward tuple."""
+        ctx = self.ctx
+        hidden_in, output, aux_term = saved
+        if ctx.is_last:
+            output.backward()
+        else:
+            grad = torch.empty(output.shape, dtype=torch.float32, device=ctx.device)
+            dist.recv(grad, src=ctx.stage + 1)
+            torch.autograd.backward([output, aux_term], [grad.to(output.dtype), None])
+        if not ctx.is_first:
+            self._isend(hidden_in.grad.contiguous(), dst=ctx.stage - 1)
 
     def train_step(self, batch: Tensor) -> dict:
         """Forward and backward over one batch [B, L+1]; gradients accumulate in the parameters."""
-        model, ctx, M = self.model, self.ctx, self.microbatches
+        ctx, M = self.ctx, self.microbatches
         if batch.size(0) % M:
             raise ValueError(f"batch size {batch.size(0)} must be divisible by --microbatches {M}")
         size = batch.size(0) // M
-        total_layers = model.config.layers
-        coef = model.router_aux_loss_coef
-        width = model.config.hidden_size
-        saved = []
-        ce_total = torch.zeros((), dtype=torch.float64)
-        aux_local, dropped_total, overflow_total = 0.0, 0, 0
+        self._totals = {"ce": 0.0, "aux": 0.0, "dropped": 0, "overflow": 0}
 
-        for index in range(M):
-            tokens = batch[index * size : (index + 1) * size].to(ctx.device)
-            hidden_in = None
-            if ctx.is_first:
-                with self.autocast():
-                    hidden = model.embed(tokens)
-            else:
-                hidden_in = torch.empty(size, tokens.size(1), width, dtype=torch.float32, device=ctx.device)
-                dist.recv(hidden_in, src=ctx.stage - 1)
-                hidden_in.requires_grad_(True)
-                hidden = hidden_in
-            with self.autocast():
-                hidden, balance, dropped, overflow, _ = model.run_blocks(hidden)
-            aux = torch.stack(balance).sum()
-            aux_term = coef * aux / total_layers / M
-            aux_local += float(aux.detach()) / M
-            dropped_total += int(torch.stack(dropped).sum())
-            overflow_total += int(torch.stack(overflow).sum())
-            if ctx.is_last:
-                with self.autocast():
-                    logits = model.head(hidden)
-                cross_entropy = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)).float(), tokens[:, 1:].reshape(-1))
-                loss = cross_entropy / M + aux_term
-                ce_total += float(cross_entropy.detach()) / M
-                saved.append((hidden_in, loss, None))
-            else:
-                dist.send(hidden.detach().float().contiguous(), dst=ctx.stage + 1)
-                saved.append((hidden_in, hidden, aux_term))
+        if self.schedule == "1f1b":
+            self._run_1f1b(batch, size)
+        else:
+            self._run_gpipe(batch, size)
+        self._drain_sends()
 
-        for index in reversed(range(M)):
-            hidden_in, output, aux_term = saved[index]
-            if ctx.is_last:
-                output.backward()
-            else:
-                grad = torch.empty(output.shape, dtype=torch.float32, device=ctx.device)
-                dist.recv(grad, src=ctx.stage + 1)
-                torch.autograd.backward([output, aux_term], [grad.to(output.dtype), None])
-            if not ctx.is_first:
-                dist.send(hidden_in.grad.contiguous(), dst=ctx.stage - 1)
-
-        totals = torch.tensor([float(ce_total), aux_local, float(dropped_total), float(overflow_total)], dtype=torch.float64, device=ctx.device)
+        totals = torch.tensor(
+            [self._totals["ce"], self._totals["aux"], float(self._totals["dropped"]), float(self._totals["overflow"])],
+            dtype=torch.float64, device=ctx.device,
+        )
         dist.all_reduce(totals)
         ce, aux_sum, dropped, overflow = totals.tolist()
-        router_aux = aux_sum / total_layers
+        router_aux = aux_sum / self.model.config.layers
+        coef = self.model.router_aux_loss_coef
         return {"loss": ce + coef * router_aux, "ce_loss": ce, "router_aux_loss": router_aux,
                 "dropped_routes": int(dropped), "overflow_routes": int(overflow)}
+
+    def _run_gpipe(self, batch: Tensor, size: int) -> None:
+        saved = [self._forward_step(batch, index, size) for index in range(self.microbatches)]
+        for index in reversed(range(self.microbatches)):
+            self._backward_step(saved[index])
+
+    def _run_1f1b(self, batch: Tensor, size: int) -> None:
+        """Non-interleaved 1F1B: warm up min(M, S - stage - 1) forwards, alternate forward/backward, then drain."""
+        stage, stages, M = self.ctx.stage, self.ctx.num_stages, self.microbatches
+        warmup = min(M, stages - stage - 1)
+        queue: deque = deque()
+        for index in range(warmup):
+            queue.append(self._forward_step(batch, index, size))
+        for index in range(warmup, M):
+            queue.append(self._forward_step(batch, index, size))
+            self._backward_step(queue.popleft())
+        while queue:
+            self._backward_step(queue.popleft())
 
 
 def clip_grad_norm_pipeline(model, ctx: PipelineContext, max_norm: float) -> float:

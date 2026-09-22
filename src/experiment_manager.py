@@ -225,6 +225,60 @@ def compare_runs(summaries: list[dict], metric: str = "benchmark.loss") -> str:
     return "\n".join(lines)
 
 
+def parse_objectives(spec) -> list[tuple[str, str]]:
+    """["benchmark.loss:min", "train.tokens_per_second:max"] -> [(path, direction), ...]. A bare path defaults to min."""
+    if isinstance(spec, str):
+        spec = [spec]
+    objectives = []
+    for item in spec:
+        path, _, direction = item.partition(":")
+        direction = direction or "min"
+        if direction not in {"min", "max"}:
+            raise ValueError(f"objective '{item}': direction must be 'min' or 'max'")
+        objectives.append((path.strip(), direction))
+    if len(objectives) < 2:
+        raise ValueError("multi-objective needs at least two objectives")
+    return objectives
+
+
+def dominates(a: dict, b: dict, objectives: list[tuple[str, str]]) -> bool:
+    """True if summary ``a`` is at least as good as ``b`` on every objective, and strictly better on one."""
+    at_least_as_good, strictly_better = True, False
+    for path, direction in objectives:
+        va, vb = dig(a, path), dig(b, path)
+        if va is None or vb is None:
+            return False
+        better = va < vb if direction == "min" else va > vb
+        worse = va > vb if direction == "min" else va < vb
+        at_least_as_good = at_least_as_good and not worse
+        strictly_better = strictly_better or better
+    return at_least_as_good and strictly_better
+
+
+def pareto_front(summaries: list[dict], objectives) -> list[dict]:
+    """The non-dominated summaries: no other completed summary is at least as good on every objective and
+    strictly better on one. ``objectives`` is parsed with ``parse_objectives`` if given as raw strings."""
+    if objectives and isinstance(objectives[0], str):
+        objectives = parse_objectives(objectives)
+    completed = [s for s in summaries if s.get("status") == "completed" and all(dig(s, path) is not None for path, _ in objectives)]
+    return [s for s in completed if not any(dominates(other, s, objectives) for other in completed if other is not s)]
+
+
+def compare_pareto(summaries: list[dict], objectives) -> str:
+    """Markdown table of every completed run, its objective values, and whether it is Pareto-optimal."""
+    parsed = parse_objectives(objectives) if objectives and isinstance(objectives[0], str) else objectives
+    completed = [s for s in summaries if s.get("status") == "completed"]
+    front = {id(s) for s in pareto_front(completed, parsed)}
+    fmt = lambda v: "-" if v is None else (f"{v:.4g}" if isinstance(v, float) else str(v))  # noqa: E731
+    columns = [f"{path} ({direction})" for path, direction in parsed]
+    lines = ["| run | " + " | ".join(columns) + " | pareto-optimal |", "|" + "---|" * (len(columns) + 2)]
+    ranked = sorted(completed, key=lambda s: id(s) not in front)  # Pareto-optimal rows first
+    for summary in ranked:
+        values = [fmt(dig(summary, path)) for path, _ in parsed]
+        lines.append(f"| {summary['run_id']} | " + " | ".join(values) + f" | {'yes' if id(summary) in front else ''} |")
+    return "\n".join(lines)
+
+
 def bar_chart_svg(values: dict[str, float], title: str) -> str:
     width, row, left = 720, 22, 260
     height = 50 + row * len(values)
@@ -281,6 +335,7 @@ def main() -> None:
     compare = commands.add_parser("compare", help="rank runs and draw comparison charts")
     compare.add_argument("runs", type=Path, nargs="+")
     compare.add_argument("--metric", default="benchmark.loss")
+    compare.add_argument("--objectives", nargs="+", help="2+ dotted.path:min|max entries; ranks by Pareto-optimality instead of --metric")
     compare.add_argument("--markdown", type=Path)
     compare.add_argument("--charts-dir", type=Path, help="write loss_curves.svg and metric_bars.svg here")
     args = parser.parse_args()
@@ -298,7 +353,7 @@ def main() -> None:
             print("\nbest:", json.loads(best.read_text()))
     else:
         summaries = load_summaries(args.runs)
-        table = compare_runs(summaries, args.metric)
+        table = compare_pareto(summaries, args.objectives) if args.objectives else compare_runs(summaries, args.metric)
         print(table)
         if args.markdown:
             args.markdown.write_text(table + "\n")

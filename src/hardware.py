@@ -8,6 +8,7 @@ Probing runs real forward/backward passes, so the batch size it returns has been
 
 import argparse
 import json
+import math
 import time
 from dataclasses import asdict, dataclass
 from typing import Callable, Optional
@@ -128,6 +129,115 @@ def suggest_num_experts(
     fixed = counts["total"] - top_k * per_expert_total
     affordable = int((info.total_memory_bytes * memory_fraction / 16 - fixed) // per_expert_total)
     return max(top_k, min(cap, affordable))
+
+
+# Backbone shape anchors, taken from the hand-verified VRAM preset tables in PARAMETERS.md (training-state budget,
+# hidden_size, layers, attention_heads, sequence_length). auto_architecture interpolates between these in
+# log(budget) space instead of using an untested closed-form formula, and always solves the expert count exactly
+# for the requested budget with suggest_num_experts.
+_SHAPE_ANCHORS = (
+    (1.80e9, 192, 4, 4, 128),
+    (2.70e9, 256, 4, 4, 128),
+    (3.60e9, 256, 6, 4, 128),
+    (5.34e9, 384, 8, 8, 256),
+    (7.15e9, 384, 10, 8, 256),
+    (10.70e9, 512, 12, 8, 512),
+    (14.24e9, 640, 14, 8, 512),
+    (17.71e9, 768, 16, 8, 512),
+    (34.63e9, 1024, 20, 8, 1024),
+)
+
+# Dense (single-expert) shapes use a different table: with no expert pool to absorb the budget, hidden/layers
+# themselves have to use it, so these are much wider at the same training-state budget than the MoE anchors above.
+_DENSE_SHAPE_ANCHORS = (
+    (1.70e9, 1344, 4, 4, 128),
+    (2.53e9, 1664, 4, 4, 128),
+    (3.60e9, 1664, 6, 4, 128),
+    (5.28e9, 1536, 8, 8, 256),
+    (7.06e9, 1664, 10, 8, 256),
+    (10.62e9, 1920, 12, 8, 512),
+    (13.63e9, 2048, 14, 8, 512),
+    (16.94e9, 2176, 16, 8, 512),
+    (33.85e9, 2816, 20, 8, 1024),
+)
+
+
+def _interpolate_shape(budget: int, points: tuple = _SHAPE_ANCHORS) -> tuple[int, int, int, int]:
+    """(hidden, layers, heads, sequence_length) for ``budget`` bytes, log-interpolated between shape anchors."""
+    if budget <= points[0][0]:
+        below, above, fraction = points[0], points[0], 0.0
+    elif budget >= points[-1][0]:
+        below, above, fraction = points[-1], points[-1], 0.0
+    else:
+        below, above = next((points[i], points[i + 1]) for i in range(len(points) - 1) if points[i][0] <= budget <= points[i + 1][0])
+        span = math.log(above[0]) - math.log(below[0])
+        fraction = (math.log(budget) - math.log(below[0])) / span if span else 0.0
+    lerp = lambda a, b: a + (b - a) * fraction  # noqa: E731
+    heads = above[3] if fraction >= 0.5 else below[3]
+    hidden = max(heads, round(lerp(below[1], above[1]) / heads) * heads)
+    layers = max(1, round(lerp(below[2], above[2])))
+    sequence_length = max(32, round(lerp(below[4], above[4]) / 32) * 32)
+    return hidden, layers, heads, sequence_length
+
+
+def auto_architecture(
+    info: DeviceInfo,
+    vocab_size: int = 7168,
+    memory_fraction: float = 0.45,
+    quality: str = "balanced",
+) -> dict:
+    """Pick a full architecture (hidden size, layers, experts, top_k, sequence length) for this device, with no
+    shape supplied — the counterpart to ``suggest_num_experts``, which only fills in one dimension of an
+    otherwise-given shape.
+
+    The backbone (hidden size, layers, heads, sequence length) is interpolated between the hand-verified shapes in
+    PARAMETERS.md's VRAM preset tables (see ``_SHAPE_ANCHORS``) rather than derived from an untested formula. The
+    expert count is then solved exactly for the requested budget with ``suggest_num_experts``.
+
+    ``quality`` trades stored capacity for depth/width at the same memory budget:
+      "capacity" - favour many experts, top_k=1 (more stored knowledge, higher sparsity)
+      "balanced" - the default; top_k=2
+      "dense"    - a single expert (see PARAMETERS.md's "Training a dense (non-MoE) model"): every parameter active
+                   on every token, so this picks a much smaller model at the same memory budget
+    """
+    if quality not in {"capacity", "balanced", "dense"}:
+        raise ValueError("quality must be capacity, balanced or dense")
+    if not info.total_memory_bytes:
+        raise ValueError("auto_architecture needs a device with known total memory")
+    budget = info.total_memory_bytes * memory_fraction
+    if quality == "dense":
+        hidden, layers, heads, sequence_length = _interpolate_shape(budget, _DENSE_SHAPE_ANCHORS)
+        ffn = round(hidden * 2.75 / 8) * 8
+        top_k = num_experts = 1
+    else:
+        hidden, layers, heads, sequence_length = _interpolate_shape(budget)
+        ffn = round(hidden * 2.75 / 8) * 8
+        top_k = 1 if quality == "capacity" else 2
+        num_experts = suggest_num_experts(info, hidden, ffn, layers, top_k, vocab_size, sequence_length, memory_fraction)
+
+    config = QuantaWeaveConfig(
+        vocab_size=vocab_size, hidden_size=hidden, layers=layers, ffn_size=ffn, num_experts=num_experts,
+        top_k=top_k, attention_heads=heads, max_sequence_length=sequence_length + 1,
+    )
+    counts = parameter_counts(config)
+    state = counts["total"] * 16
+    if state > 0.9 * info.total_memory_bytes:
+        # the anchor tables span a 4-80GB*0.45 range of budgets; outside that they clamp to the nearest anchor
+        # instead of truly extrapolating, so a very small memory_fraction (or a very small device) can ask for a
+        # shape that does not fit at all rather than one that is merely tight
+        raise ValueError(
+            f"no architecture fits: the smallest shape this can produce needs {state / 1e9:.2f} GB, but the device "
+            f"has {info.total_memory_bytes / 1e9:.2f} GB. Lower --total-experts/--hidden-size by hand instead of "
+            f"relying on auto_architecture this far below its tested range."
+        )
+    return {
+        "hidden_size": hidden, "layers": layers, "ffn_size": ffn, "attention_heads": heads,
+        "total_experts": num_experts, "active_experts": top_k, "vocab_size": vocab_size,
+        "sequence_length": sequence_length, "quality": quality,
+        "total_parameters": counts["total"], "active_parameters": counts["active"],
+        "training_state_bytes": state, "budget_bytes": budget,
+        "training_state_fraction_of_budget": state / budget,
+    }
 
 
 def _is_oom(error: BaseException) -> bool:
@@ -286,6 +396,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", choices=("auto", "cuda", "rocm", "xpu", "cpu"))
     parser.add_argument("--probe", action="store_true", help="run real passes to find a safe batch size")
+    parser.add_argument("--auto-architecture", action="store_true",
+                        help="pick hidden size, layers, experts and sequence length for this device instead of taking a shape")
+    parser.add_argument("--quality", default="balanced", choices=("capacity", "balanced", "dense"),
+                        help="--auto-architecture only: favour stored capacity, a balance, or a dense (single-expert) model")
+    parser.add_argument("--memory-fraction", type=float, default=0.45, help="--auto-architecture only: share of device memory to target")
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--ffn-size", type=int, default=128)
@@ -296,6 +411,11 @@ def main() -> None:
     parser.add_argument("--precision", default="auto", choices=("auto", "bf16", "fp16", "fp32"))
     args = parser.parse_args()
     info = detect(args.device)
+    if args.auto_architecture:
+        shape = auto_architecture(info, args.vocab_size, args.memory_fraction, args.quality)
+        args.hidden_size, args.layers, args.ffn_size = shape["hidden_size"], shape["layers"], shape["ffn_size"]
+        args.total_experts, args.active_experts = shape["total_experts"], shape["active_experts"]
+        args.sequence_length = shape["sequence_length"]
     config = QuantaWeaveConfig(
         vocab_size=args.vocab_size, hidden_size=args.hidden_size, layers=args.layers, ffn_size=args.ffn_size,
         num_experts=args.total_experts, top_k=args.active_experts, max_sequence_length=args.sequence_length + 1,
@@ -304,6 +424,8 @@ def main() -> None:
     report["suggested_num_experts"] = suggest_num_experts(
         info, args.hidden_size, args.ffn_size, args.layers, args.active_experts, args.vocab_size, args.sequence_length
     )
+    if args.auto_architecture:
+        report["auto_architecture"] = shape
     print(json.dumps(report, indent=2))
 
 

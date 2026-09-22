@@ -55,21 +55,50 @@ def parity_shapes(config: QuantaWeaveConfig) -> list[tuple[int, int]]:
     return [(1, longest), (3, max(2, longest // 2)), (2, 2)]
 
 
-def try_onnx(wrapper: LogitsOnly, example: torch.Tensor, path: Path) -> dict:
+def try_onnx(wrapper: LogitsOnly, example: torch.Tensor, path: Path, max_sequence_length: int) -> dict:
+    """Export with the torch.export-based ("dynamo") exporter and real dynamic batch/sequence dims.
+
+    The legacy ``dynamic_axes`` exporter (``dynamo=False``) declares dynamic axes but does not reliably honour
+    them for this model: nn.MultiheadAttention's internal reshapes bake in the traced example's exact shape, so
+    the graph silently only works at that one shape (verified: it raises a shape-mismatch error at any other
+    batch/sequence length). ``dynamic_shapes`` with ``torch.export.Dim`` on the dynamo exporter does not have
+    this problem. If onnxruntime is available, the export is round-tripped at a second, different shape before
+    being reported as ok, so "ok" here means numerically verified, not just "the exporter did not raise".
+
+    Traced with a batch of 2, not ``example`` (typically batch 1): torch.export treats a traced dimension of
+    exactly 1 as ambiguously static (it can mean "broadcast", not "dynamic"), so exporting with a batch-1 example
+    silently freezes the batch dimension to 1 and the export then fails on any other batch size, including 1
+    passed positionally through a differently-shaped call (verified). Batch 2 has no such ambiguity.
+    """
     try:
         import onnx  # noqa: F401
     except ImportError:
         return {"status": "skipped", "reason": "the `onnx` package is not installed"}
     try:
+        onnx_example = example if example.size(0) != 1 else example.expand(2, -1).contiguous()
+        batch, sequence = torch.export.Dim("batch"), torch.export.Dim("sequence", max=max_sequence_length)
         torch.onnx.export(
-            wrapper, (example,), str(path), input_names=["input_ids"], output_names=["logits"],
-            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}, "logits": {0: "batch", 1: "sequence"}},
-            dynamo=False,
+            wrapper, (onnx_example,), str(path), input_names=["input_ids"], output_names=["logits"],
+            dynamic_shapes={"input_ids": {0: batch, 1: sequence}}, dynamo=True,
         )
     except Exception as error:  # exporter failures are informative, not fatal
         path.unlink(missing_ok=True)
         return {"status": "failed", "reason": f"{type(error).__name__}: {error}"[:300]}
-    return {"status": "ok", "file": path.name}
+    result = {"status": "ok", "file": path.name}
+    try:
+        import onnxruntime as ort
+
+        session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        probe = torch.randint(0, wrapper.model.config.vocab_size, (example.size(0) + 1, min(max_sequence_length, example.size(1) + 3)))
+        with torch.inference_mode():
+            expected = wrapper(probe)
+        actual = torch.from_numpy(session.run(None, {"input_ids": probe.numpy()})[0])
+        result["dynamic_shape_verified"] = True
+        result["verified_max_abs_diff"] = float((actual - expected).abs().max())
+    except ImportError:
+        result["dynamic_shape_verified"] = False
+        result["note"] = "onnxruntime is not installed; the export was not round-tripped to confirm dynamic shapes actually work"
+    return result
 
 
 def export_bundle(
@@ -116,7 +145,7 @@ def export_bundle(
     }
 
     if onnx:
-        metadata["onnx"] = try_onnx(wrapper, example, output / "model.onnx")
+        metadata["onnx"] = try_onnx(wrapper, example, output / "model.onnx", config.max_sequence_length - 1)
 
     if quantize_bits:
         quantized_model, _ = load_checkpoint_model(checkpoint)

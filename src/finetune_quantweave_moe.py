@@ -25,7 +25,7 @@ from run_bundle import add_archive_arguments, create_run_bundle, reproduce_comma
 from lora import add_lora, load_adapter, merge_lora_state, save_adapter
 from quantization import quantize_model
 from quantweave_moe_model import QuantaWeaveConfig, QuantaWeaveMoEForCausalLM
-from train_quantweave_moe import autocast_context, select_device, write_checkpoint_metadata
+from train_quantweave_moe import autocast_context, build_optimizer, select_device, write_checkpoint_metadata
 
 
 def load_base(checkpoint: Path, device: torch.device) -> QuantaWeaveMoEForCausalLM:
@@ -33,20 +33,6 @@ def load_base(checkpoint: Path, device: torch.device) -> QuantaWeaveMoEForCausal
     model = QuantaWeaveMoEForCausalLM(config)
     model.load_state_dict(torch.load(checkpoint / "model.pt", map_location="cpu", weights_only=False)["model"])
     return model.to(device)
-
-
-def build_optimizer(kind: str, parameters, lr: float):
-    if kind == "adamw":
-        return torch.optim.AdamW(parameters, lr=lr)
-    if kind == "adamw8bit":
-        try:
-            import bitsandbytes as bnb
-        except ImportError as error:
-            raise RuntimeError("--optimizer adamw8bit needs the bitsandbytes package") from error
-        if not torch.cuda.is_available():
-            raise RuntimeError("--optimizer adamw8bit needs a CUDA device")
-        return bnb.optim.AdamW8bit(parameters, lr=lr)
-    raise ValueError("optimizer must be adamw or adamw8bit")
 
 
 @torch.no_grad()

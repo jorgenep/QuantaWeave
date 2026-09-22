@@ -129,6 +129,53 @@ class BPETokenizer:
         (directory / "tokenizer_meta.json").write_text(json.dumps({"type": "bpe"}) + "\n")
 
 
+class SentencePieceTokenizer:
+    """Unigram or BPE tokenizer trained from scratch with Google's ``sentencepiece`` library.
+
+    Unlike the byte-level ``BPETokenizer`` above, sentencepiece's default ``unigram`` algorithm is a probabilistic
+    subword model (Kudo, 2018) rather than greedy merges, and works directly on raw text with its own internal
+    normalization instead of a byte-level pre-tokenizer. Pass ``algorithm="bpe"`` for a sentencepiece-flavoured BPE
+    tokenizer instead, if you want merges but with sentencepiece's normalization/whitespace handling.
+    """
+
+    kind = "sentencepiece"
+
+    def __init__(self, processor) -> None:
+        self.processor = processor
+        self.unk_id = processor.unk_id()
+        self.eos_id = processor.eos_id()
+
+    @property
+    def vocab_size(self) -> int:
+        return self.processor.vocab_size()
+
+    @classmethod
+    def train(cls, texts: Iterable[str], vocab_size: int, algorithm: str = "unigram") -> "SentencePieceTokenizer":
+        import io
+
+        import sentencepiece as spm
+
+        if algorithm not in {"unigram", "bpe"}:
+            raise ValueError("algorithm must be 'unigram' or 'bpe'")
+        buffer = io.BytesIO()
+        spm.SentencePieceTrainer.Train(
+            sentence_iterator=iter(texts), model_writer=buffer, vocab_size=vocab_size, model_type=algorithm,
+            unk_id=0, bos_id=-1, eos_id=1, pad_id=-1, unk_piece="<unk>", eos_piece="<eos>",
+        )
+        return cls(spm.SentencePieceProcessor(model_proto=buffer.getvalue()))
+
+    def encode(self, text: str) -> list[int]:
+        return self.processor.encode(text)
+
+    def decode(self, ids: Iterable[int]) -> str:
+        return self.processor.decode([int(i) for i in ids])
+
+    def save(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tokenizer.model").write_bytes(self.processor.serialized_model_proto())
+        (directory / "tokenizer_meta.json").write_text(json.dumps({"type": "sentencepiece"}) + "\n")
+
+
 def load_tokenizer(directory: Path):
     """Load the tokenizer saved beside a checkpoint. A bare vocab.json means a character tokenizer."""
     directory = Path(directory)
@@ -138,6 +185,10 @@ def load_tokenizer(directory: Path):
         from tokenizers import Tokenizer
 
         return BPETokenizer(Tokenizer.from_file(str(directory / "tokenizer.json")))
+    if kind == "sentencepiece":
+        import sentencepiece as spm
+
+        return SentencePieceTokenizer(spm.SentencePieceProcessor(model_file=str(directory / "tokenizer.model")))
     return CharTokenizer(json.loads((directory / "vocab.json").read_text()))
 
 
@@ -148,6 +199,8 @@ def token_classes(tokenizer) -> tuple[Tensor, list[str]]:
     for token_id in range(tokenizer.vocab_size):
         if isinstance(tokenizer, CharTokenizer):
             text = tokenizer.inverse.get(token_id, "")
+        elif isinstance(tokenizer, SentencePieceTokenizer):
+            text = tokenizer.processor.id_to_piece(token_id).replace("▁", " ")
         else:
             text = (tokenizer.tokenizer.id_to_token(token_id) or "").replace("Ġ", " ").replace("Ċ", "\n")
         if text in SPECIAL_TOKENS:
@@ -307,6 +360,45 @@ class WindowDataset(Dataset):
     def fingerprint(self) -> str:
         digest = hashlib.sha256(f"{len(self)}|{self.window}|{self.domains}".encode())
         return digest.hexdigest()[:16]
+
+    @classmethod
+    def _view(cls, corpus: TokenCorpus, window: int, domains: list[str], starts: Tensor, window_domains: Tensor) -> "WindowDataset":
+        """A restricted view over a subset of windows, sharing the corpus rather than rescanning it."""
+        view = cls.__new__(cls)
+        view.corpus, view.window, view.domains = corpus, window, domains
+        view.starts, view.window_domains = starts, window_domains
+        return view
+
+    def split_train_val(self, val_fraction: float = 0.02, seed: int = 0, min_val_windows_per_domain: int = 1) -> tuple["WindowDataset", "WindowDataset"]:
+        """Split into (train, val), holding out ``val_fraction`` of each domain's windows.
+
+        Domain-aware: the split is stratified per domain rather than taken globally, so a small domain isn't
+        left with zero validation windows (or entirely absent from training) purely by chance. Deterministic
+        for a given ``seed``, and the two views never overlap. Raises if any domain has too few windows to hold
+        any out at all (``val_fraction`` too small, or the domain itself too small).
+        """
+        if not 0 < val_fraction < 1:
+            raise ValueError("val_fraction must be in (0, 1)")
+        generator = torch.Generator().manual_seed(seed)
+        train_parts, val_parts = [], []
+        for domain_index in range(len(self.domains)):
+            positions = (self.window_domains == domain_index).nonzero(as_tuple=True)[0]
+            if positions.numel() == 0:
+                continue
+            order = positions[torch.randperm(positions.numel(), generator=generator)]
+            held_out = max(min_val_windows_per_domain, round(positions.numel() * val_fraction))
+            if held_out >= positions.numel():
+                raise ValueError(
+                    f"domain '{self.domains[domain_index]}' has only {positions.numel()} window(s), too few to "
+                    f"both train on and hold out {held_out} for validation; lower val_fraction or add data"
+                )
+            val_parts.append(order[:held_out])
+            train_parts.append(order[held_out:])
+        train_indices = torch.cat(train_parts).sort().values
+        val_indices = torch.cat(val_parts).sort().values
+        train = self._view(self.corpus, self.window, self.domains, self.starts[train_indices], self.window_domains[train_indices])
+        val = self._view(self.corpus, self.window, self.domains, self.starts[val_indices], self.window_domains[val_indices])
+        return train, val
 
 
 class CharacterDataset(WindowDataset):

@@ -92,16 +92,21 @@ class TopKMoE(nn.Module):
         self.profile_experts = False
         self.use_triton_kernels = False
         self.expert_bias: Optional[Tensor] = None   # straggler-aware routing: added to logits when choosing experts
+        self.capacity_scale: float = 1.0             # straggler-aware capacity: multiplies capacity_factor (see capacity())
         self.expert_seconds = [0.0] * self.num_local_experts
         self.last_top_indices: Optional[Tensor] = None
         self.last_stats: dict[str, Tensor] = {}
 
     def capacity(self, num_tokens: int) -> int:
-        """Route slots per expert; everything fits when capacity is disabled."""
+        """Route slots per expert; everything fits when capacity is disabled.
+
+        ``capacity_scale`` (default 1.0, harmless for a single device) multiplies the effective capacity factor;
+        expert-parallel training uses it to let a slow or overloaded rank tighten its own capacity independently
+        of the router bias (see expert_parallel.DeviceLoadTracker)."""
         if self.capacity_factor > 0 and self.drop_overflow_tokens:
             return max(
                 self.min_expert_capacity,
-                math.ceil(num_tokens * self.top_k / self.num_experts * self.capacity_factor),
+                math.ceil(num_tokens * self.top_k / self.num_experts * self.capacity_factor * self.capacity_scale),
             )
         return num_tokens * self.top_k
 

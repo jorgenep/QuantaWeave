@@ -16,6 +16,7 @@ measures how long each rank spends in its experts and biases the routers away fr
 CPU (Gloo) processes; NCCL/XCCL use the same collectives but have not been exercised on multi-GPU hardware.
 """
 
+import json
 import os
 import re
 import shutil
@@ -29,7 +30,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from quantweave_moe_model import QuantaWeaveConfig, TopKMoE
-from tensor_parallel import is_tp_sharded_shared, merge_state_dicts
+from tensor_parallel import is_tp_sharded_shared, merge_state_dicts, shard_state_dict
 
 EXPERT_KEY = re.compile(r"(experts\.)(\d+)(\.)")
 BLOCK_KEY = re.compile(r"^blocks\.(\d+)\.")
@@ -275,7 +276,8 @@ def finish(ctx) -> None:
 
 # ---- straggler-aware routing -------------------------------------------------------------------------------
 class DeviceLoadTracker:
-    """Measures per-rank expert compute and steers routing away from slow or overloaded ranks.
+    """Measures per-rank expert compute and steers routing (and, optionally, capacity) away from slow or
+    overloaded ranks.
 
     Every ``interval`` steps each rank's accumulated expert time (and processed rows) per layer is gathered. This is
     an integral controller: a rank whose time is above the group mean has its routing bias lowered a little, a fast rank
@@ -284,12 +286,28 @@ class DeviceLoadTracker:
     without its experts being trusted less. Because the bias accumulates, it holds its value once the ranks are balanced
     instead of snapping back (which would oscillate). Time grows with rows and with per-row cost, so this balances both
     load and device speed. Biases are computed identically on every rank so replicated routers agree.
+
+    ``adapt_capacity=True`` adds a second, faster-reacting lever on top of the bias: each rank's own expert capacity
+    (``TopKMoE.capacity_scale``) is set to ``clamp(mean_time / this_rank_time, 0.5, 2.0)`` every interval, so a rank
+    that is still slow *after* the routing bias has taken effect (an imperfectly-balanced bias, or a genuinely
+    popular local expert) sheds the excess by dropping instead of falling behind. This is a real capacity response,
+    not just less traffic being routed there.
+
+    ``gather_expert_utilization()`` gathers every rank's own per-(global)-expert routed-token counts for the
+    data batch it processed (only meaningful for a step where the model's ``collect_stats`` was on) into one
+    ``[world_size, layers, num_experts]`` tensor: since each rank sees different data through the same
+    fully-replicated router, this shows how the *global* expert distribution differs by device/data-shard, for a
+    genuine per-device routing report instead of only the coordinating rank's local view (see
+    ``routing_diagnostics.RoutingMonitor.record_device_utilization``).
     """
 
     def __init__(self, model, ctx: ExpertParallelContext, strength: float = 0.5, max_bias: float = 2.0,
-                 rate: float = 0.5, interval: int = 10) -> None:
+                 rate: float = 0.5, interval: int = 10, adapt_capacity: bool = False,
+                 capacity_scale_min: float = 0.5, capacity_scale_max: float = 2.0) -> None:
         self.model, self.ctx = model, ctx
         self.strength, self.max_bias, self.rate, self.interval = strength, max_bias, rate, interval
+        self.adapt_capacity = adapt_capacity
+        self.capacity_scale_min, self.capacity_scale_max = capacity_scale_min, capacity_scale_max
         self.layers = len(model.moes())
         self.rank_bias = torch.zeros(self.layers, ctx.world_size, dtype=torch.float64)
         self.history: list[dict] = []
@@ -327,6 +345,12 @@ class DeviceLoadTracker:
             self.rank_bias = bias - bias.mean(dim=1, keepdim=True)       # only differences between ranks matter
             self._apply()
         metrics["rank_bias"] = self.rank_bias.mean(dim=0).tolist()
+        if self.adapt_capacity and float(seconds.sum()) > 0:
+            mean_time = seconds.mean(dim=1, keepdim=True).clamp(min=1e-12)
+            scale = (mean_time / seconds.clamp(min=1e-12)).clamp(self.capacity_scale_min, self.capacity_scale_max)
+            for layer, moe in enumerate(self.model.moes()):
+                moe.capacity_scale = float(scale[layer, self.ctx.rank])
+            metrics["capacity_scale"] = scale.mean(dim=0).tolist()
         self.history.append(metrics)
         return metrics
 
@@ -335,6 +359,19 @@ class DeviceLoadTracker:
         for layer, moe in enumerate(self.model.moes()):
             bias = self.rank_bias[layer].repeat_interleave(per_rank).to(torch.float32)
             moe.expert_bias = bias.to(self.ctx.device)
+
+    def gather_expert_utilization(self) -> Tensor:
+        """Every rank's own ``expert_load`` (from ``TopKMoE.last_stats``, i.e. requires ``collect_stats=True`` for
+        this forward pass — a [num_experts] count over ALL global experts, since the router is fully replicated and
+        scores every expert regardless of expert-parallel sharding), gathered into ``[world_size, layers,
+        num_experts]`` and returned on every rank."""
+        local = torch.stack([moe.last_stats["expert_load"].to(torch.float64) for moe in self.model.moes()]).to(self.ctx.device)
+        if self.ctx.tp_size > 1:
+            dist.all_reduce(local, group=self.ctx.tp_group)
+            local /= self.ctx.tp_size
+        gathered = [torch.zeros_like(local) for _ in range(self.ctx.world_size)]
+        dist.all_gather(gathered, local, group=self.ctx.group)
+        return torch.stack(gathered).cpu()  # [world_size, layers, num_experts]
 
     def state_dict(self) -> dict:
         return {"rank_bias": self.rank_bias.tolist()}
@@ -378,6 +415,9 @@ def save_sharded_checkpoint(directory, model, optimizer, step: int, tokenizer, c
 
 
 def load_sharded_checkpoint(directory, model, optimizer, ctx, extra_out: Optional[dict] = None) -> int:
+    """Load a rank's shard. ``optimizer: null`` (as written by ``reshard_checkpoint``, which has no optimizer
+    state to reshard) is valid: the model loads and training resumes with a fresh optimizer, same as loading any
+    weights-only checkpoint."""
     from train_quantweave_moe import restore_rng
 
     checkpoint = torch.load(shard_path(directory, ctx.global_rank), map_location=ctx.device, weights_only=False)
@@ -385,7 +425,8 @@ def load_sharded_checkpoint(directory, model, optimizer, ctx, extra_out: Optiona
         raise ValueError(f"checkpoint was written with layout {checkpoint.get('layout')} on {checkpoint['world_size']} ranks "
                          f"but this run is {ctx.layout()} on {ctx.global_size}")
     model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    if checkpoint.get("optimizer") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
     restore_rng(checkpoint.get("rng_state", {}), ctx.device)
     if extra_out is not None:
         extra_out.update(checkpoint.get("extra", {}))
@@ -417,6 +458,57 @@ def _merge_pipeline(shards: list[dict]) -> dict:
                 key = f"blocks.{start + int(match.group(1))}." + key[match.end():]
             merged[key] = tensor
     return merged
+
+
+def reshard_checkpoint(checkpoint_dir, output_dir, ep_size: int, tp_size: int = 1) -> dict:
+    """The inverse of ``consolidate_checkpoint``: split a single-file checkpoint into ``ep_size x tp_size`` shards
+    for a *different* expert-parallel / tensor-parallel world size than it was made with (or made from scratch,
+    dense or otherwise). The usual path is train -> consolidate -> reshard for more (or fewer) GPUs -> resume.
+
+    Weights only, like ``consolidate_checkpoint``: there is no optimizer state to reshard, since the source is an
+    ordinary checkpoint. Training resumed from a reshard starts with a fresh optimizer, same as loading any
+    checkpoint into a new run without its own saved optimizer state.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    config = json.loads((checkpoint_dir / "config.json").read_text())
+    if config["num_experts"] % ep_size:
+        raise ValueError(f"num_experts {config['num_experts']} must be divisible by ep_size {ep_size}")
+    if tp_size > 1:
+        if config["attention_heads"] % tp_size:
+            raise ValueError(f"attention_heads {config['attention_heads']} must be divisible by tp_size {tp_size}")
+        if config["ffn_size"] % tp_size:
+            raise ValueError(f"ffn_size {config['ffn_size']} must be divisible by tp_size {tp_size}")
+    checkpoint = torch.load(checkpoint_dir / "model.pt", map_location="cpu", weights_only=False)
+    state = checkpoint["model"]
+    per_rank = config["num_experts"] // ep_size
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for ep_rank in range(ep_size):
+        keep = set(range(ep_rank * per_rank, (ep_rank + 1) * per_rank))
+        ep_state: dict = {}
+        for key, tensor in state.items():
+            match = EXPERT_KEY.search(key)
+            if match is None:
+                ep_state[key] = tensor
+                continue
+            index = int(match.group(2))
+            if index in keep:
+                ep_state[EXPERT_KEY.sub(lambda m: f"{m.group(1)}{index - ep_rank * per_rank}{m.group(3)}", key, count=1)] = tensor
+        for tp_rank in range(tp_size):
+            shard_state = shard_state_dict(ep_state, tp_rank, tp_size) if tp_size > 1 else ep_state
+            global_rank = ep_rank * tp_size + tp_rank
+            torch.save({
+                "model": shard_state, "optimizer": None, "step": checkpoint.get("step", 0),
+                "rng_state": {}, "world_size": ep_size * tp_size, "rank": global_rank,
+                "layout": {"kind": "ep", "ep_rank": ep_rank, "ep_size": ep_size, "tp_rank": tp_rank, "tp_size": tp_size},
+                "extra": checkpoint.get("extra", {}),
+            }, shard_path(output_dir, global_rank))
+    for name in ("config.json", "vocab.json", "tokenizer.json", "tokenizer_meta.json", "metadata.json"):
+        if (checkpoint_dir / name).exists():
+            shutil.copy(checkpoint_dir / name, output_dir / name)
+    return {"ep_size": ep_size, "tp_size": tp_size, "world_size": ep_size * tp_size, "per_rank_experts": per_rank,
+            "shards": [str(shard_path(output_dir, r)) for r in range(ep_size * tp_size)]}
 
 
 def consolidate_checkpoint(shards_dir, output_dir) -> None:

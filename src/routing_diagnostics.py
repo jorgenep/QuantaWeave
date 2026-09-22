@@ -38,6 +38,7 @@ class RoutingMonitor:
         self.class_usage = torch.zeros(num_layers, num_classes, num_experts, dtype=torch.long)
         self.domain_usage = torch.zeros(num_layers, len(self.domains), num_experts, dtype=torch.long)
         self.total_load = torch.zeros(num_layers, num_experts, dtype=torch.long)
+        self.device_load: Optional[Tensor] = None  # [world_size, layers, num_experts], set by record_device_utilization
 
     def _reset_window(self) -> None:
         L, E = self.num_layers, self.num_experts
@@ -147,6 +148,15 @@ class RoutingMonitor:
         return record
 
     # ---- reports ----------------------------------------------------------
+    def record_device_utilization(self, per_device: Tensor) -> None:
+        """Accumulate a [world_size, layers, num_experts] tensor from expert_parallel.DeviceLoadTracker's
+        gather_expert_utilization() into the run's per-device totals: how the *global* expert distribution differs
+        across devices/data-shards, for a genuine multi-device routing report rather than only the coordinating
+        rank's own local view."""
+        if self.device_load is None:
+            self.device_load = torch.zeros_like(per_device, dtype=torch.float64)
+        self.device_load += per_device.double()
+
     def write_report(self, out_dir: Optional[Path] = None) -> Path:
         """Render heatmaps and time series as SVG plus an index.html; returns the index path."""
         out_dir = out_dir or self.out_dir
@@ -164,6 +174,17 @@ class RoutingMonitor:
         if self.total_load.sum() > 0:
             share = self.total_load.double() / self.total_load.sum(dim=1, keepdim=True).clamp(min=1)
             save("expert_usage_by_layer.svg", heatmap_svg(share.tolist(), layers, experts, "Expert usage share by layer (whole run)"))
+        if self.device_load is not None and self.device_load.sum() > 0:
+            world_size, layers = self.device_load.shape[0], self.device_load.shape[1]
+            devices = [f"device {r}" for r in range(world_size)]
+            for layer in range(layers):
+                per_device = self.device_load[:, layer]
+                experts = [f"expert {e}" for e in range(per_device.shape[1])]
+                share = per_device / per_device.sum(dim=1, keepdim=True).clamp(min=1)
+                save(f"device_utilization_layer{layer}.svg",
+                     heatmap_svg(share.tolist(), devices, experts, f"Layer {layer}: global expert distribution of each device's own data"))
+            totals = self.device_load.sum(dim=(1, 2))
+            save("routed_tokens_by_device.svg", bar_chart_svg(dict(zip(devices, totals.tolist())), "Routed tokens by device (whole run)"))
         if self.token_classes is not None and self.class_usage.sum() > 0:
             names = self.token_classes[1]
             for layer in range(self.num_layers):
@@ -260,5 +281,24 @@ def line_chart_svg(x: Sequence[float], series: dict[str, Sequence[float]], title
         colour = palette[index % len(palette)]
         parts.append(f'<polyline fill="none" stroke="{colour}" stroke-width="1.5" points="{points}"/>')
         parts.append(f'<text x="{width - 100}" y="{top + 12 * index}" fill="{colour}">{html.escape(name)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def bar_chart_svg(values: dict[str, float], title: str) -> str:
+    width, left, top, bottom, bar_height, gap = 720, 140, 40, 20, 18, 6
+    height = top + bottom + len(values) * (bar_height + gap)
+    peak = max(values.values(), default=0.0) or 1.0
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" font-family="sans-serif" font-size="11">',
+        f'<text x="{left}" y="20" font-size="14" font-weight="bold">{html.escape(title)}</text>',
+    ]
+    for index, (name, value) in enumerate(values.items()):
+        y = top + index * (bar_height + gap)
+        bar_width = (value / peak) * (width - left - 80)
+        parts.append(f'<text x="{left - 6}" y="{y + bar_height * 0.75:.1f}" text-anchor="end">{html.escape(name)}</text>')
+        parts.append(f'<rect x="{left}" y="{y}" width="{bar_width:.1f}" height="{bar_height}" fill="#1f77b4">'
+                      f"<title>{html.escape(name)}: {value:.4g}</title></rect>")
+        parts.append(f'<text x="{left + bar_width + 6:.1f}" y="{y + bar_height * 0.75:.1f}">{value:.4g}</text>')
     parts.append("</svg>")
     return "".join(parts)

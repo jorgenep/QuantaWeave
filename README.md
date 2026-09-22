@@ -52,10 +52,12 @@ src/
   moe_schedules.py              LR / aux-weight / capacity / router-temperature schedules and controllers
   routing_diagnostics.py        Router monitor, JSONL log, SVG heatmaps
   training_metrics.py           Metrics log, plateau and stability detection
-  data_pipeline.py              Tokenizers, token corpora, memmap, curriculum, domain sampling, BatchStream
-  prepare_tokens.py             Train a BPE tokenizer / pack a memory-mapped token corpus
-  hardware.py                   Device detection, precision choice, safe batch-size probe
-  expert_parallel.py            Expert + tensor parallelism, straggler-aware routing, sharded checkpoints
+  data_pipeline.py              Tokenizers (BPE, SentencePiece, char), token corpora, memmap, curriculum,
+                                 domain sampling, BatchStream, domain-stratified train/val split
+  prepare_tokens.py             Train a BPE or SentencePiece tokenizer / pack a memory-mapped token corpus
+  hardware.py                   Device detection, precision choice, safe batch-size probe, auto-architecture
+  expert_parallel.py            Expert + tensor parallelism, straggler-aware routing and capacity, sharded
+                                 checkpoints, resharding onto a different world size
   tensor_parallel.py            Megatron-style attention/FFN slicing and collectives
   pipeline_parallel.py          Pipeline stages, GPipe micro-batch schedule
   sharded_optimizer.py          ZeRO-style optimizer-state sharding
@@ -70,9 +72,10 @@ src/
   generate_quantweave_moe.py    Text sampling (simple, one prompt)
   quantization.py               Weight-only int8 / int4 for inference
   run_bundle.py                 Per-run archive folders named by epoch time
-  export_quantweave.py          Inference bundle: TorchScript, int8/int4, tokenizer, metadata
-  experiment_manager.py         Tracked runs, comparison, best-run pointer
-  sweep.py                      Grid / random / successive-halving search
+  export_quantweave.py          Inference bundle: TorchScript, ONNX, int8/int4, tokenizer, metadata
+  serve_quantweave.py           FastAPI/uvicorn HTTP server: /generate, /chat, /generate/stream (SSE)
+  experiment_manager.py         Tracked runs, comparison, best-run pointer, Pareto-front comparison
+  sweep.py                      Grid / random / successive-halving / Bayesian / BOHB-style search
   model_scaling.py              Architecture calculator and manifest builder
   prepare_smoke_dataset.py      Bounded TinyStories downloader
   data.py, pack_dataset.py      Large production dataset compiler and packer (Axolotl path)
@@ -86,6 +89,7 @@ scripts/
   chat_quantweave.sh            Chat / send messages launcher
   distill_quantweave.sh         Distillation launcher
   export_quantweave.sh          Export launcher
+  serve_quantweave.sh           HTTP server launcher
   smoke_quantweave.sh           Bounded data and manifest smoke test
   eval_pipeline.sh              Axolotl checkpoint evaluation pipeline
 
@@ -206,6 +210,19 @@ Important controls:
 - `--overflow-policy`: `drop` or `residual`. Both enforce capacity the same way: each expert keeps its highest-weight routes, and a route that does not fit is skipped, so the token keeps its residual stream unchanged for that route. They differ only in reporting: `drop` counts skipped routes in `dropped_routes`, `residual` does not (both report them in `overflow_routes`)
 - `--no-drop-overflow-tokens`: disable capacity enforcement entirely
 
+### Auto-picking an architecture from the detected hardware
+
+`src/train_quantweave_moe.py --auto-architecture` (or `src/hardware.py --auto-architecture` standalone) picks hidden size, layer count, FFN size, expert count, active experts, and sequence length from the detected device's memory, instead of choosing a preset by hand. It log-interpolates between the hand-verified shapes in `PARAMETERS.md`'s preset tables (a closed-form formula was tried first and produced badly unbalanced shapes — see `FUTURE_IDEAS.md`), so it stays within the tables' range and does not extrapolate confidently far outside it.
+
+```bash
+python3 src/train_quantweave_moe.py --data data/train.jsonl \
+  --auto-architecture --auto-architecture-quality balanced --auto-architecture-memory-fraction 0.5
+```
+
+- `--auto-architecture-quality`: `capacity` (many small experts, MoE-style), `balanced`, or `dense` (few large experts / effectively dense) — matches the `quality` axis PARAMETERS.md's tables are built from
+- `--auto-architecture-memory-fraction`: fraction of detected device memory to target for the training state (weights + optimizer + activations), default leaves headroom for the OS/driver
+- Resolved values are written into `reproduce_args` in the run archive, so an auto-picked shape is still exactly reproducible later
+
 The calculator estimates parameter counts. The final model implementation is the authority for exact counts because attention projections, biases, embeddings, and auxiliary layers affect totals.
 
 ## Run The Standalone MoE
@@ -273,6 +290,17 @@ MOE_STEPS=10000 \
 ./scripts/run_quantweave_moe.sh
 ```
 
+### Resharding an expert/tensor-parallel checkpoint onto a different world size
+
+`expert_parallel.reshard_checkpoint(checkpoint_dir, output_dir, ep_size, tp_size=1)` rewrites a sharded checkpoint's expert-parallel and tensor-parallel shard count — e.g. a checkpoint saved with 4 expert-parallel ranks can be resharded onto 2 or 8 before resuming with a different amount of hardware. It is weights-only (no optimizer state), and is verified by loading the resharded checkpoint back across real distributed ranks and diffing outputs against the original single-device model.
+
+```python
+from expert_parallel import reshard_checkpoint
+reshard_checkpoint("artifacts/checkpoints/run-8gpu", "artifacts/checkpoints/run-2gpu", ep_size=2)
+```
+
+Resume from it with `--allow-config-change` (the world size legitimately differs from the run fingerprint that produced it).
+
 ## Training Schedules And Adaptive Control
 
 `--lr-decay {constant,cosine,linear}` with `--warmup-steps`, `--min-lr-ratio`, and `--schedule-steps` (the horizon, default `--steps`). Every `--controller-interval` steps the controllers look at what training measured:
@@ -291,7 +319,12 @@ MOE_STEPS=10000 \
 
 ## Data Pipeline
 
-**Tokenizers.** `--tokenizer char` (default) or `--tokenizer bpe --tokenizer-path DIR` for a byte-level BPE tokenizer trained from scratch on your data (needs the `tokenizers` package; `--vocab-size` must be at least 258). Checkpoints carry their tokenizer, so benchmark, generate, distill and export work for either kind.
+**Tokenizers.** `--tokenizer char` (default), `--tokenizer bpe --tokenizer-path DIR` for a byte-level BPE tokenizer trained from scratch on your data (needs the `tokenizers` package; `--vocab-size` must be at least 258), or `--tokenizer sentencepiece --tokenizer-path DIR --tokenizer-algorithm {unigram,bpe}` for a SentencePiece tokenizer (needs the `sentencepiece` package). Checkpoints carry their tokenizer, so benchmark, generate, distill and export work for any of the three.
+
+```bash
+python src/prepare_tokens.py sentencepiece --data a.jsonl b.jsonl --vocab-size 8000 --algorithm unigram --output artifacts/tokenizers/spm8k
+python src/train_quantweave_moe.py --data a.jsonl --tokenizer sentencepiece --tokenizer-path artifacts/tokenizers/spm8k
+```
 
 **Packed corpora.** For anything larger than RAM-friendly JSONL, pack once and train from a memory-mapped file:
 
@@ -305,12 +338,15 @@ python src/train_quantweave_moe.py --token-data data/tokens/mixed --steps 5000
 
 **Curriculum.** `--curriculum {rarity,entropy,uncommon} --curriculum-steps N` scores every window and starts sampling from the easiest 25% (`--curriculum-start-fraction`), widening linearly to all windows by step N. `rarity` is the mean negative log unigram frequency of the window's tokens, `entropy` the window's token entropy, `uncommon` the share of tokens from the rarest 10% of the vocabulary.
 
+**Held-out validation.** `--val-fraction 0.02` splits off a fraction of windows per domain (seeded by `--val-seed`, never overlapping the training windows by absolute corpus offset, not just content) before training starts; `--val-interval N` evaluates mean loss over `--val-batches` batches of the held-out split every N steps, logged as `val_loss` and folded into the run summary (`val_loss`, `best_val_loss`, `val_windows`). Not combinable with `--pipeline-parallel`.
+
 ## Routing Diagnostics
 
 `--diagnostics-dir DIR --diagnostics-interval N` records router statistics every N steps (the adaptive controllers turn this on by themselves). Output:
 
 - `routing_log.jsonl`: per layer utilization, requested share, router entropy (and its maximum), top-1 confidence and its histogram, drop rate, drops per expert, dead experts, plus load imbalance and active-expert fraction and which token classes were dropped
 - `index.html` with SVG heatmaps: expert usage by layer, per-layer expert utilization over time, expert share per token class (letter/digit/space/punct), expert share per domain, and drop-rate and entropy curves
+- with `--expert-parallel` and (`--straggler-capacity` or `--device-metrics`) also set, per-device heatmaps: for each layer, how the global expert distribution differs across devices/data-shards (`device_utilization_layer*.svg`), plus total routed tokens per device (`routed_tokens_by_device.svg`) — previously this view existed only on rank 0's own local traffic
 
 `--metrics-file metrics.jsonl` writes one JSON object per logged step (loss, LR, routing controls, overflow fraction, gradient norm, tokens/s). The end-of-run summary includes plateau detection, the step training first became stable, and the active/total parameter ratio.
 
@@ -319,6 +355,8 @@ python src/train_quantweave_moe.py --token-data data/tokens/mixed --steps 5000
 For a full walkthrough of every training flag, what it costs in VRAM, and how to size a model to your GPU before running it, see **[PARAMETERS.md](PARAMETERS.md)**.
 
 `--precision {auto,bf16,fp16,fp32}` runs the forward pass in mixed precision over fp32 weights (`auto`: bf16 on accelerators, fp32 on CPU; fp16 uses a gradient scaler). The router always runs in fp32, because a flipped top-k choice changes which expert runs. `--activation-checkpointing` recomputes each block's activations in backward.
+
+`--optimizer {adamw,adamw8bit,adamw_cpu_offload}` trades optimizer-state memory for something else: `adamw8bit` (CUDA + bitsandbytes) stores AdamW's moments in 8 bits instead of fp32; `adamw_cpu_offload` (`src/cpu_offload_optimizer.py`) keeps them in pinned system RAM instead of device memory, at the cost of a real host↔device transfer every step — see PARAMETERS.md's ["System RAM and CPU offloading"](PARAMETERS.md#system-ram-and-cpu-offloading-can-i-train-bigger-than-my-vram-by-using-ram-too) section for what it does and does not save. Neither is combinable with `--shard-optimizer`.
 
 ```bash
 python src/hardware.py                       # device, memory, bf16/fp16 support, runtime
@@ -363,11 +401,15 @@ All of these are launched with `torchrun` and were verified against the single-d
 
 **Straggler-aware routing** (`--straggler-routing`, plus `--device-metrics` for just the numbers). Every `--straggler-interval` steps each rank's expert time and rows are gathered. An integral controller lowers the routing bias of ranks that are slower or more loaded than the mean and raises it for fast ones; the bias steers which experts are *chosen*, not how much they are trusted. `time_imbalance` and `rows_imbalance` (max over mean across ranks) are logged. `--simulate-slow-rank RANK:SECONDS_PER_ROW` makes one rank artificially slow, which is how it is tested.
 
-**Pipeline parallelism** (`--pipeline-parallel --microbatches M`). Layers are split into contiguous stages (embeddings on the first stage, final norm and lm_head on the last); micro-batches flow through with point-to-point sends on a GPipe schedule (all forwards, then all backwards), with a global gradient norm across stages. It has the usual pipeline bubble and holds M micro-batches of activations per stage (add `--activation-checkpointing` to trade compute for memory). The router balance loss is computed per micro-batch, so with M > 1 it differs slightly from the whole-batch value. Not combinable with expert/tensor parallelism; diagnostics, the domain loss and gradient accumulation are unavailable in this mode.
+**Straggler-aware capacity** (`--straggler-capacity`, combinable with `--straggler-routing`). A second, faster-reacting lever on top of the routing bias: every `--straggler-interval` steps, each rank's own MoE capacity multiplier (`TopKMoE.capacity_scale`, clamped to `[--straggler-capacity-min, --straggler-capacity-max]`, default `[0.5, 2.0]`) is set from `mean_time / this_rank_time`, so a rank still slow after the bias has taken effect sheds the excess by dropping instead of falling behind — a real capacity response, not just less traffic routed there. Logged as `capacity_scale` in the device metrics.
+
+**Pipeline parallelism** (`--pipeline-parallel --microbatches M`). Layers are split into contiguous stages (embeddings on the first stage, final norm and lm_head on the last); micro-batches flow through with point-to-point sends, with a global gradient norm across stages. It has the usual pipeline bubble and holds M micro-batches of activations per stage (add `--activation-checkpointing` to trade compute for memory). The router balance loss is computed per micro-batch, so with M > 1 it differs slightly from the whole-batch value. Not combinable with expert/tensor parallelism; diagnostics, the domain loss and gradient accumulation are unavailable in this mode.
+
+`--pipeline-schedule {gpipe,1f1b}` picks the schedule: `gpipe` (default) runs all forwards then all backwards, holding M micro-batches of activations per stage; `1f1b` interleaves them (one forward, one backward, once warmed up) so peak activation memory drops to roughly the number of stages instead of M, at the same bubble ratio — each stage independently runs `min(M, stages - stage - 1)` warm-up forwards, then alternates, then drains (the standard PipeDream-flush schedule). Point-to-point sends use non-blocking `isend` (waited on at the end of the step): 1F1B can have two adjacent stages each mid-send to the other at once, which deadlocks with blocking `send` (found and fixed by running it live — see `FUTURE_IDEAS.md`). Verified to produce the same loss and gradients as `gpipe` (up to floating-point summation order) across several stage/micro-batch combinations, including micro-batches below the stage count.
 
 ```bash
-MOE_GPUS=4 MOE_TENSOR_PARALLEL=2 MOE_TOTAL_EXPERTS=16 MOE_EXTRA_ARGS="--shard-optimizer --straggler-routing" ./scripts/run_expert_parallel.sh
-MOE_GPUS=2 MOE_LAYERS=8 MOE_MICROBATCHES=4 MOE_BATCH_SIZE=8 ./scripts/run_pipeline_parallel.sh
+MOE_GPUS=4 MOE_TENSOR_PARALLEL=2 MOE_TOTAL_EXPERTS=16 MOE_EXTRA_ARGS="--shard-optimizer --straggler-routing --straggler-capacity" ./scripts/run_expert_parallel.sh
+MOE_GPUS=2 MOE_LAYERS=8 MOE_MICROBATCHES=4 MOE_BATCH_SIZE=8 MOE_EXTRA_ARGS="--pipeline-schedule 1f1b" ./scripts/run_pipeline_parallel.sh
 ```
 
 Adaptive controllers that need cross-rank routing statistics (`--aux-adapt`, `--temperature-adapt`) are not available with multi-process modes. Not implemented: vocabulary-parallel embeddings, combining pipeline with expert/tensor parallelism, and asynchronous expert scheduling.
@@ -466,9 +508,20 @@ python src/distill_quantweave_moe.py --student artifacts/outputs/quantweave-moe-
 MOE_QUANTIZE=8 MOE_BENCHMARK_DATA=data/smoke/tinystories.jsonl ./scripts/export_quantweave.sh
 ```
 
-writes a bundle under `artifacts/exports/quantweave-moe/`: a traced TorchScript model with dynamic batch and sequence length (`model.torchscript.pt`) and its graph text, an optional int8 or int4 weight-only copy, the tokenizer and config, and `export_metadata.json` (file sizes and SHA-256 hashes, traced-vs-eager numerical parity on several shapes, quantization compression and logit cosine similarity, optional benchmark numbers). Exported graphs evaluate every expert densely with its router weight (no capacity limit and no data-dependent control flow), so they are for portability and deployment-style evaluation, not for sparse speed. `--onnx` additionally tries an ONNX export and records the outcome; it needs the `onnx` package, which is not installed by default, so that path is untested here. Load a bundle without any model code via `export_quantweave.load_exported(dir)`.
+writes a bundle under `artifacts/exports/quantweave-moe/`: a traced TorchScript model with dynamic batch and sequence length (`model.torchscript.pt`) and its graph text, an optional int8 or int4 weight-only copy, the tokenizer and config, and `export_metadata.json` (file sizes and SHA-256 hashes, traced-vs-eager numerical parity on several shapes, quantization compression and logit cosine similarity, optional benchmark numbers). Exported graphs evaluate every expert densely with its router weight (no capacity limit and no data-dependent control flow), so they are for portability and deployment-style evaluation, not for sparse speed. `--onnx` additionally exports ONNX with the `torch.export`-based ("dynamo") exporter and real dynamic batch/sequence dims (`torch.export.Dim`, not the legacy `dynamic_axes` exporter, which does not reliably honour dynamic shapes for this model — see `FUTURE_IDEAS.md`); when the `onnxruntime` package is available the export is round-tripped at a second, different shape before being reported ok, recorded as `dynamic_shape_verified`/`verified_max_abs_diff` in the metadata. Load a bundle without any model code via `export_quantweave.load_exported(dir)`.
 
 Quantization (`src/quantization.py`) covers the expert weights, which hold nearly all parameters: int8 with one scale per row, or int4 packed two per byte with per-group scales. The router stays fp32. It saves memory and bandwidth (weights are dequantized on the fly) rather than FLOPs, and it is inference-only; training uses bf16/fp16 autocast.
+
+## Serving
+
+```bash
+MOE_CHECKPOINT=artifacts/outputs/quantweave-moe-out ./scripts/serve_quantweave.sh
+curl -s localhost:8000/generate -d '{"prompt": "Once upon a time", "temperature": 0}' | python3 -m json.tool
+curl -s localhost:8000/chat -d '{"messages": [{"role": "user", "content": "hi"}]}' | python3 -m json.tool
+curl -N localhost:8000/generate/stream -d '{"prompt": "Once upon a time", "tokens": 200}'   # text/event-stream
+```
+
+`src/serve_quantweave.py` is a FastAPI/uvicorn HTTP server around the same KV-cache/CUDA-graph decoder the chat tool uses (`chat_quantweave_moe.py`/`fast_decode.py`), so a request behaves exactly like the equivalent `chat_quantweave_moe.py` call. One model, one process: the decoder's KV cache is mutable per-request state, so concurrent requests are serialized behind an `asyncio.Lock` (generation runs in a worker thread so the event loop still accepts and queues requests while one runs). Routes: `/health`, `/generate`, `/chat`, `/generate/stream` (Server-Sent Events). This is a single-model reference server, not a batching/multi-tenant inference engine, and has no auth beyond what you put in front of it (a reverse proxy).
 
 ## Quantized Fine-Tuning (QLoRA)
 
@@ -490,7 +543,9 @@ python src/sweep.py --config configs/sweep_example.yaml
 
 Each run gets a unique id and a directory with `config.json`, `metrics.jsonl`, `train.log`, routing diagnostics, checkpoints, the final model, a benchmark, `summary.json` and `report.md`; `best.json` in the runs directory points at the best run on the config's objective (default: benchmark loss). Failed runs are recorded with their traceback rather than aborting a sweep. `compare` ranks runs, shows only the options that differ between them, and draws loss curves and a metric bar chart as SVG. The benchmark evaluates on the training corpus unless `benchmark.data` names a held-out file.
 
-Sweeps support `grid`, `random` (lists, `loguniform`, `uniform`, `int`), `halving` (successive halving: the top 1/eta of each rung continue with eta times the steps) and `bayes`. Bayesian search (`src/bayes_opt.py`, torch only) fits a Gaussian process (Matern-5/2 kernel, hyperparameters chosen by marginal likelihood) to the trials so far and runs the point with the highest expected improvement next, after `bayes.n_init` random trials; it never proposes invalid combinations or repeats a point, and a failed trial is remembered without teaching the model a fake value. Combinations that cannot work, such as more active than total experts, are skipped and listed.
+Sweeps support `grid`, `random` (lists, `loguniform`, `uniform`, `int`), `halving` (successive halving: the top 1/eta of each rung continue with eta times the steps), `bayes` and `bohb` (a BOHB-style hybrid, not full BOHB: rung 0 is generated by the Bayesian optimizer's `suggest()`/`observe()` instead of randomly, and higher rungs promote survivors exactly as plain halving does — there is no budget-conditioned model over the halving dimension). Bayesian search (`src/bayes_opt.py`, torch only) fits a Gaussian process (Matern-5/2 kernel, hyperparameters chosen by marginal likelihood) to the trials so far and runs the point with the highest expected improvement next, after `bayes.n_init` random trials; it never proposes invalid combinations or repeats a point, and a failed trial is remembered without teaching the model a fake value. Combinations that cannot work, such as more active than total experts, are skipped and listed.
+
+**Multi-objective (Pareto-front) comparison.** `experiment_manager.py compare --objectives loss:min,tokens_per_second:max` (in place of `--metric`) ranks by dominance instead of one scalar: a run dominates another only if it is at least as good on every objective and strictly better on one, and the non-dominated set is marked `pareto-optimal` in the comparison table. A sweep config with an `objectives` list computes the same Pareto front over the final rung's completed trials and adds a "## Pareto front" section to its report.
 
 ## Send Messages To A Model
 
@@ -561,6 +616,8 @@ accelerate launch -m axolotl.cli.train configs/quantweave_moe.yaml
 ```
 
 DeepSpeed ZeRO-3 partitions memory but does not create expert routing. FlashAttention, bitsandbytes, Triton, and some DeepSpeed operators may be vendor-specific. Use the standalone trainer when cross-vendor CUDA/ROCm/XPU portability is the priority.
+
+`configs/deepspeed_zero3.json` already offloads optimizer state to system RAM (`offload_optimizer: cpu`); this is the only training path here that can use system RAM to go beyond a single GPU's VRAM. See [PARAMETERS.md's "System RAM and CPU offloading"](PARAMETERS.md#system-ram-and-cpu-offloading-can-i-train-bigger-than-my-vram-by-using-ram-too) section for what it does and doesn't buy you — the standalone trainer has no such path.
 
 ## Current Scope
 
