@@ -14,7 +14,7 @@ from train_quantweave_moe import autocast_context, select_device
 def sample_text(model, tokenizer, prompt: str, tokens: int, temperature: float, device: torch.device, precision: str = "auto") -> str:
     """Autoregressive sampling; stops at <eos>. Works for any model returning {"logits": ...}."""
     generated = tokenizer.encode(prompt) or [tokenizer.unk_id]
-    context_length = model.config.max_sequence_length
+    context_length = model.config.max_sequence_length - 1        # the last position of a training window is never trained
     with torch.inference_mode():
         for _ in range(tokens):
             context = torch.tensor([generated[-context_length:]], dtype=torch.long, device=device)

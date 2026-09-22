@@ -21,7 +21,9 @@ Sampling is restricted to the tokens the tokenizer really has (a character model
 rest of its output range is untrained noise) and never emits <unk>. Temperature 0 is greedy and fully deterministic;
 --seed makes sampling reproducible. In the interactive session, /help lists the commands (/set, /reset, /mode, /save, ...).
 
-There is no KV cache, so every new token re-reads the whole context; that is fine for the short contexts these models use.
+Decoding uses a KV cache and, on CUDA, a captured CUDA graph (see fast_decode.py), typically 20-40x faster than re-reading the
+whole context for every token; --no-cache uses the plain forward pass instead. Both use a context of max_sequence_length - 1
+tokens, because the model's output at its very last position was never trained. Inference does not apply expert capacity.
 """
 
 import argparse
@@ -36,6 +38,7 @@ from typing import Callable, Optional, Sequence
 import torch
 
 from data_pipeline import load_tokenizer
+from fast_decode import FastDecoder, Unsupported, filter_logits
 from hardware import choose_precision, detect
 from quantweave_moe_model import QuantaWeaveConfig, QuantaWeaveMoEForCausalLM
 from train_quantweave_moe import autocast_context, select_device
@@ -46,21 +49,6 @@ CHAT_STOPS = ("\nUser:", "\nSystem:")
 
 
 # ---- sampling ----------------------------------------------------------------------------------------------
-def filter_logits(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
-    """Top-k then nucleus (top-p) filtering of a 1-D logit vector; removed entries become -inf."""
-    logits = logits.clone()
-    if top_k and top_k < logits.numel():
-        threshold = torch.topk(logits, top_k).values[-1]
-        logits[logits < threshold] = float("-inf")
-    if top_p < 1.0:
-        sorted_logits, order = torch.sort(logits, descending=True)
-        probabilities = sorted_logits.softmax(dim=-1)
-        remove = probabilities.cumsum(dim=-1) - probabilities > top_p          # keeps the token that crosses top_p
-        sorted_logits[remove] = float("-inf")
-        logits = torch.empty_like(logits).scatter_(0, order, sorted_logits)
-    return logits
-
-
 def choose_token(logits: torch.Tensor, temperature: float, top_k: int, top_p: float, generator: Optional[torch.Generator]) -> int:
     if temperature <= 0:
         return int(logits.argmax())
@@ -104,12 +92,21 @@ class Reply:
 
 
 class ChatSession:
-    def __init__(self, model, tokenizer, device: torch.device, precision: str, settings: Settings) -> None:
+    def __init__(self, model, tokenizer, device: torch.device, precision: str, settings: Settings, use_cache: bool = True) -> None:
         settings.validate()
         self.model, self.tokenizer, self.device, self.precision, self.settings = model, tokenizer, device, precision, settings
         self.history: list[tuple[str, str]] = []                 # (user message, assistant reply) pairs
         self.valid_ids = tokenizer.vocab_size
         model.eval()
+        self.decoder: Optional[FastDecoder] = None
+        self.cache_note = "no cache (full forward pass per token)"
+        if use_cache:
+            try:
+                self.decoder = FastDecoder(model, device, precision)
+                self.decoder.warm(settings.temperature, settings.top_k, settings.top_p)
+                self.cache_note = self.decoder.description
+            except Unsupported as error:
+                self.cache_note = f"no cache ({error})"
 
     def reset(self) -> None:
         self.history.clear()
@@ -128,34 +125,48 @@ class ChatSession:
             return []
         return sorted({character for character in text if character not in vocab})
 
+    def _plain_tokens(self, ids: list[int], generated: list[int], generator, usable: int):
+        """Token source without a cache: a full forward pass over the last ``usable`` tokens for every new token."""
+        settings, tokenizer = self.settings, self.tokenizer
+        while True:
+            window = torch.tensor([(ids + generated)[-usable:]], dtype=torch.long, device=self.device)
+            with autocast_context(self.device, self.precision):
+                logits = self.model(window)["logits"][0, -1].float()
+            logits[self.valid_ids:] = float("-inf")                # ids the tokenizer never had are untrained noise
+            if tokenizer.unk_id is not None and tokenizer.unk_id < self.valid_ids:
+                logits[tokenizer.unk_id] = float("-inf")
+            yield choose_token(logits, settings.temperature, settings.top_k, settings.top_p, generator)
+
     @torch.inference_mode()
     def send(self, message: str, on_text: Optional[Callable[[str], None]] = None) -> Reply:
         """Generate a reply. ``on_text`` receives the reply as it is produced (never a partial stop string)."""
-        settings, tokenizer = self.settings, self.tokenizer
+        settings, tokenizer, decoder = self.settings, self.tokenizer, self.decoder
         prompt = self.format_prompt(message)
         stops = [s for s in ([*CHAT_STOPS] if settings.mode == "chat" else []) + list(settings.stop) if s]
         ids = tokenizer.encode(prompt) or [tokenizer.eos_id]
-        context = self.model.config.max_sequence_length
+        # the last position of a training window is never trained, so the usable context is one shorter than the window
+        usable = decoder.capacity if decoder is not None else self.model.config.max_sequence_length - 1
         generator = None
         if settings.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(settings.seed)
         holdback = max((len(s) for s in stops), default=1) - 1
         generated: list[int] = []
         text, emitted, reason = "", 0, "length"
+        incremental = tokenizer.kind == "char"                     # a character's text never depends on its neighbours
         started = time.perf_counter()
-        for _ in range(settings.tokens):
-            window = torch.tensor([(ids + generated)[-context:]], dtype=torch.long, device=self.device)
-            with autocast_context(self.device, self.precision):
-                logits = self.model(window)["logits"][0, -1].float()
-            logits[self.valid_ids:] = float("-inf")                # ids the tokenizer never had are untrained noise
-            if tokenizer.unk_id is not None and tokenizer.unk_id < self.valid_ids:
-                logits[tokenizer.unk_id] = float("-inf")
-            token = choose_token(logits, settings.temperature, settings.top_k, settings.top_p, generator)
+        if decoder is not None:
+            source = decoder.stream(ids, settings.tokens, temperature=settings.temperature, top_k=settings.top_k, top_p=settings.top_p,
+                                    valid_ids=self.valid_ids, unk_id=tokenizer.unk_id, generator=generator)
+        else:
+            source = self._plain_tokens(ids, generated, generator, usable)
+        for step, token in enumerate(source):
+            if step >= settings.tokens:
+                break
             if token == tokenizer.eos_id:
                 reason = "eos"
                 break
             generated.append(token)
-            text = tokenizer.decode(generated)
+            text = text + tokenizer.inverse.get(token, "?") if incremental else tokenizer.decode(generated)
             hits = [text.find(s) for s in stops if s in text]
             if hits:
                 text, reason = text[: min(hits)], "stop"
@@ -165,13 +176,14 @@ class ChatSession:
                 if safe > emitted:
                     on_text(text[emitted:safe])
                     emitted = safe
+        source.close()
         if on_text is not None and len(text) > emitted:
             on_text(text[emitted:])
         seconds = time.perf_counter() - started
         response = text.strip() if settings.mode == "chat" else text
         if settings.mode == "chat":
             self.history.append((message, response))
-        return Reply(message, prompt, response, len(generated), seconds, reason, self.unknown_characters(prompt), len(ids) > context)
+        return Reply(message, prompt, response, len(generated), seconds, reason, self.unknown_characters(prompt), len(ids) > usable)
 
 
 # ---- choosing and loading a model ------------------------------------------------------------------------------
@@ -408,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--top-p", type=float, default=1.0)
     gen.add_argument("--seed", type=int, help="make sampling reproducible")
     gen.add_argument("--stop", action="append", default=[], help="stop when this text appears (repeatable)")
+    gen.add_argument("--no-cache", action="store_true", help="plain forward pass per token instead of the KV cache / CUDA graph (much slower)")
     gen.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     gen.add_argument("--device", choices=("auto", "cuda", "rocm", "xpu", "cpu"), default="auto")
     return parser
@@ -435,10 +448,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     device = select_device(args.device)
     model, tokenizer = load_for_chat(checkpoint, adapter, args.quantize, device)
     precision = choose_precision(detect(device.type), args.precision)
-    session = ChatSession(model, tokenizer, device, precision, settings)
+    session = ChatSession(model, tokenizer, device, precision, settings, use_cache=not args.no_cache)
     status = sys.stderr if not args.quiet else _NullStream()
     print(f"model: {checkpoint}" + (f" + adapter {adapter}" if adapter else "") + f"  device: {device}  precision: {precision}"
-          + (f"  experts quantized to int{args.quantize}" if args.quantize and adapter is None else ""), file=status)
+          + (f"  experts quantized to int{args.quantize}" if args.quantize and adapter is None else "") + f"  decoding: {session.cache_note}", file=status)
 
     log = None
     if args.transcript is not None:

@@ -113,7 +113,7 @@ def test_stop_strings_truncate_and_streaming_never_leaks_a_partial_stop():
 def test_long_prompts_are_windowed_to_the_models_context_and_empty_prompts_work():
     s = session(ids_of("ab"), context=8, tokens=2)
     reply = s.send("a" * 40)
-    assert reply.truncated_context and max(s.model.windows) <= 8 and reply.response == "ab"
+    assert reply.truncated_context and max(s.model.windows) <= 7 and reply.response == "ab"       # one less than the 8-token window
     empty = session(ids_of("ab"), tokens=2)
     assert empty.send("").response == "ab"
 

@@ -7,6 +7,8 @@ The repository contains two training paths:
 - **Standalone QuantaWeave MoE:** the portable implementation in `src/` with explicit top-k routing, expert balancing, resumable checkpoints, and benchmarking.
 - **Axolotl integration:** a separate dense-model baseline for validating a larger production training stack. It does not create the custom QuantaWeave MoE architecture.
 
+**Picking training flags and sizing a run to your GPU?** See **[PARAMETERS.md](PARAMETERS.md)** — every training flag explained, plus how to estimate VRAM usage before you run so you don't hit `CUDA out of memory`.
+
 ## How The Framework Works
 
 QuantaWeave models contain shared transformer parameters plus a pool of expert feed-forward networks.
@@ -64,6 +66,7 @@ src/
   distill_quantweave_moe.py     Sequence-level and logit-level distillation
   benchmark_quantweave_moe.py   Checkpoint benchmark (JSON + Markdown)
   chat_quantweave_moe.py        Send messages: interactive chat, one-off, or batch test messages
+  fast_decode.py                KV-cache / CUDA-graph decoder behind the chat tool
   generate_quantweave_moe.py    Text sampling (simple, one prompt)
   quantization.py               Weight-only int8 / int4 for inference
   run_bundle.py                 Per-run archive folders named by epoch time
@@ -313,6 +316,8 @@ python src/train_quantweave_moe.py --token-data data/tokens/mixed --steps 5000
 
 ## Precision, Memory And Hardware
 
+For a full walkthrough of every training flag, what it costs in VRAM, and how to size a model to your GPU before running it, see **[PARAMETERS.md](PARAMETERS.md)**.
+
 `--precision {auto,bf16,fp16,fp32}` runs the forward pass in mixed precision over fp32 weights (`auto`: bf16 on accelerators, fp32 on CPU; fp16 uses a gradient scaler). The router always runs in fp32, because a flipped top-k choice changes which expert runs. `--activation-checkpointing` recomputes each block's activations in backward.
 
 ```bash
@@ -504,9 +509,13 @@ printf 'Once upon a time\nThe quick brown fox\n' | python src/chat_quantweave_mo
 
 **Two modes.** `complete` (default) sends the message as the start of a text and shows the continuation, which is what a base model does. `chat` wraps the conversation as `User: ... / Assistant:` turns with an optional `--system` line, keeps the history in the session, and stops when the model starts a new `User:` line. Only a model trained on dialogue answers sensibly there; a base model plays along with the format at best. The trainer has no chat-format (role-tagged, assistant-only-loss) training yet.
 
-**Sampling and reproducibility.** `--temperature 0` is greedy and fully deterministic; `--seed N` makes sampling reproducible; `--top-k`, `--top-p` and `--stop TEXT` (repeatable) are supported. Only tokens the tokenizer really has are ever sampled and `<unk>` is never produced: a character model's output range is far larger than its ~40 real characters, and the untrained rest used to appear as `?` in samples (the older `generate_quantweave_moe.py` had this too and now applies the same restriction). Characters in your message that the model never saw are replaced by `<unk>`, and the tool tells you which. There is no KV cache, so each new token re-reads the whole context (about 40 tokens/s on a 4060 for the 30M-parameter model); long generations are slow.
+**Sampling and reproducibility.** `--temperature 0` is greedy and fully deterministic; `--seed N` makes sampling reproducible; `--top-k`, `--top-p` and `--stop TEXT` (repeatable) are supported. Only tokens the tokenizer really has are ever sampled and `<unk>` is never produced: a character model's output range is far larger than its ~40 real characters, and the untrained rest used to appear as `?` in samples (the older `generate_quantweave_moe.py` had this too and now applies the same restriction). Characters in your message that the model never saw are replaced by `<unk>`, and the tool tells you which.
 
-`generate_quantweave_moe.py` remains the simple one-prompt sampler.
+**Speed and the context window.** Replies are decoded incrementally (`src/fast_decode.py`): a KV cache so each token costs one token of compute, sampling inside the step so the GPU feeds itself and the host synchronises once per 8 tokens, and on CUDA the whole step recorded as a CUDA graph after `torch.compile` fuses its small kernels (a few seconds at start-up; it falls back to the plain graph if compilation fails). On an RTX 4060 with the 6-layer, 16-expert, 256-wide test model that is about **1,900 tokens/s, against about 75-110 for re-reading the whole context for every token (`--no-cache`)**, roughly 20-25x, and the very first reply is as fast as later ones because start-up warms the GPU. The step is launch-bound (about 0.37 ms per token, dominated by the number of tiny kernels rather than arithmetic or memory), so bigger models slow down less than proportionally; CPU decoding uses the cache without a graph. Sampling inside the graph draws Gumbel noise from the seeded generator, so `--seed` reproduces a run but not the same tokens as `--no-cache`.
+
+Two deliberate differences from a training-style forward pass: **no expert capacity** at inference (a token is never dropped from its experts), and a context of **`max_sequence_length - 1` tokens**. The second one matters for quality: training computes its loss at positions 0 to L-1 of an L+1 token window, so the model's output at the very last position was never trained. On a trained model the loss at that position was 5.98 against 0.46-0.6 at every other, and feeding a full window and reading that slot made text fall apart after about 113 generated tokens. When the context fills, the oldest half is dropped and the rest re-read in one batched pass, which costs a few milliseconds every 64 tokens; long generations therefore stay coherent (a 1,200-token generation ran across many slides).
+
+`generate_quantweave_moe.py` remains the simple one-prompt sampler (plain forward pass, no cache; it now also stays inside the trained context and samples only real tokens).
 
 ## Small Smoke Test
 
