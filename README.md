@@ -80,6 +80,10 @@ src/
   sweep.py                      Grid / random / successive-halving / Bayesian / BOHB-style search
   model_scaling.py              Architecture calculator and manifest builder
   prepare_smoke_dataset.py      Bounded TinyStories downloader
+  build_code_corpus.py          Language-weighted code + natural-language corpus puller (bigcode/starcoderdata +
+                                 HuggingFaceFW/fineweb-edu), sized to a token budget rather than bulk-downloaded
+  energy_tracking.py            GPU electricity-cost tracking: hwmon energy counter -> cumulative kWh / USD,
+                                 written into metrics.jsonl (--electricity-rate-usd-kwh, --no-power-tracking)
   data.py, pack_dataset.py      Large production dataset compiler and packer (Axolotl path)
 
 scripts/
@@ -122,6 +126,12 @@ deploy/
   slurm/train_multi_node.sbatch  Multi-node training via srun + torchrun (unverified — see Production Deployment)
   k8s/train-job.yaml             Multi-node training as a plain Kubernetes Indexed Job (unverified)
   k8s/serve-deployment.yaml      serve_quantweave.py behind a Deployment + Service, hardening flags on (unverified)
+  dashboard/index.html           Live training viewer: loss/lr/router charts (polls metrics.jsonl) plus a System
+                                  tab (CPU/RAM/swap, GPU temp/clock/power/VRAM/per-engine utilization)
+  dashboard/serve_dashboard.py   Dependency-free stdlib server for the above — auto-discovers whichever run under
+                                  --runs-dir was written to most recently, serves live system telemetry from
+                                  sysfs/procfs/DRM fdinfo, and supports --bind-interface (e.g. a VPN/Tailscale
+                                  interface name, resolved at startup) to avoid exposing it on every interface
 
 Dockerfile, .dockerignore         CUDA container image (see Production Deployment; not built in this project's own testing)
 SECURITY.md                      Checkpoint trust boundary, serving/training-data risks — read before deploying
@@ -129,6 +139,8 @@ SECURITY.md                      Checkpoint trust boundary, serving/training-dat
 axolotl/                         Existing Axolotl checkout
 .venv/                           Lightweight data/smoke environment
 .axolotl-venv/                   Python 3.12 Axolotl environment
+.intel-venv/                     Intel XPU environment (see Environments below and PARAMETERS.md's
+                                  "Intel XPU (Arc / Battlemage) caveats")
 ```
 
 ## Environments
@@ -150,6 +162,22 @@ uv pip install --python .axolotl-venv/bin/python -e './axolotl[deepspeed]'
 ```
 
 The standalone trainer does not require Axolotl. Use `.axolotl-venv` because it already contains the compatible PyTorch stack used by the project.
+
+Create the Intel XPU environment (verified on an Arc Pro B70; needs the `xe` kernel driver and a working
+Level-Zero runtime already on the host — no extra Intel Extension for PyTorch package required, stock
+PyTorch's XPU wheels are enough):
+
+```bash
+uv venv --python 3.12 .intel-venv
+uv pip install --python .intel-venv/bin/python torch --index-url https://download.pytorch.org/whl/xpu
+uv pip install --python .intel-venv/bin/python -e '.[data,tools]'
+```
+
+Verify with `.intel-venv/bin/python -c "import torch; print(torch.xpu.is_available())"`, then run with
+`MOE_PYTHON=.intel-venv/bin/python MOE_DEVICE=xpu ./scripts/run_quantweave_moe.sh`. Before sizing a real run,
+read PARAMETERS.md's **Intel XPU (Arc / Battlemage) caveats** section — this driver crashes on device OOM
+instead of raising a catchable exception (so `--auto-batch-size` isn't safe here), and host RAM rather than
+GPU VRAM is usually the real ceiling on model size.
 
 ## Device Backends
 
@@ -176,6 +204,10 @@ python -c "import torch; print(hasattr(torch, 'xpu')); print(torch.xpu.is_availa
 ```
 
 Use the matching vendor-specific PyTorch build and driver/runtime. Do not reuse a CUDA-only virtual environment on an Intel machine. `MOE_DEVICE=auto` selects CUDA/ROCm first, then XPU, then CPU.
+
+XPU has been verified end-to-end (training, checkpointing, resume, benchmarking) on an Intel Arc Pro B70 — see
+PARAMETERS.md's **Intel XPU (Arc / Battlemage) caveats** for the two driver-specific gotchas worth knowing before
+a long run (`--auto-batch-size` isn't safe on it, and host RAM is usually the real ceiling, not VRAM).
 
 ## Configure An Architecture
 
@@ -358,7 +390,25 @@ python src/train_quantweave_moe.py --token-data data/tokens/mixed --steps 5000
 - `index.html` with SVG heatmaps: expert usage by layer, per-layer expert utilization over time, expert share per token class (letter/digit/space/punct), expert share per domain, and drop-rate and entropy curves
 - with `--expert-parallel` and (`--straggler-capacity` or `--device-metrics`) also set, per-device heatmaps: for each layer, how the global expert distribution differs across devices/data-shards (`device_utilization_layer*.svg`), plus total routed tokens per device (`routed_tokens_by_device.svg`) — previously this view existed only on rank 0's own local traffic
 
-`--metrics-file metrics.jsonl` writes one JSON object per logged step (loss, LR, routing controls, overflow fraction, gradient norm, tokens/s). The end-of-run summary includes plateau detection, the step training first became stable, and the active/total parameter ratio.
+`--metrics-file metrics.jsonl` writes one JSON object per logged step (loss, LR, routing controls, overflow fraction, gradient norm, tokens/s). With power tracking on (the default; `--no-power-tracking` disables it, `--electricity-rate-usd-kwh` sets the rate), each row also gets `gpu_power_watts`, `energy_kwh_cumulative` and `cost_usd_cumulative` — read from the GPU driver's hwmon energy counter, so it needs no extra hardware and costs nothing to leave on; it's simply omitted on a host that doesn't expose one. The end-of-run summary includes plateau detection, the step training first became stable, the active/total parameter ratio, and (with power tracking) `energy_kwh_total`/`cost_usd_total`.
+
+## Live Dashboard
+
+`deploy/dashboard/serve_dashboard.py --runs-dir artifacts/outputs --port 8090` serves a live browser view of a
+run's `metrics.jsonl` (loss, validation loss, LR, gradient norm, router aux loss, overflow, tokens/s, and the
+power/cost fields above if enabled) plus a second tab of live system telemetry (CPU%, RAM/swap, and GPU
+temperature/clock/power/per-engine utilization/VRAM, read from sysfs, procfs and DRM fdinfo — no `nvidia-smi`
+equivalent needed for XPU). It has no dependencies beyond the Python standard library, auto-discovers whichever
+run under `--runs-dir` was written to most recently rather than needing a fixed path, and both the metrics poll
+rate and the system-telemetry poll rate/history window are adjustable from the page itself. Everything it does
+is read-only against files a training run already writes and a few driver-exposed sensors — it never touches a
+running training process.
+
+Pass `--bind-interface <name>` (e.g. `tailscale0`, a WireGuard interface, or your LAN NIC) to bind only to that
+interface's address instead of every interface (`--host`'s default, `0.0.0.0`) — the address is resolved at
+startup, so it isn't hardcoded and keeps working if a VPN reassigns it later. Worth doing before leaving this
+running unattended: a plain `0.0.0.0` bind is reachable over any address the host has, including a public IPv6
+one if your network doesn't specifically firewall that (unlike IPv4, there's typically no NAT hiding it).
 
 ## Precision, Memory And Hardware
 

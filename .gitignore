@@ -15,6 +15,7 @@ __pycache__/
 data/raw/
 data/packed/
 data/teacher/
+data/tokens/
 artifacts/
 last_run_prepared/
 *.jsonl
@@ -23,6 +24,7 @@ last_run_prepared/
 *.log
 wandb/
 benchmark-report.json
+benchmark-report-*.json
 Modelfile.eval
 
 # Local tooling

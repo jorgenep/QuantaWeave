@@ -20,6 +20,7 @@ tests/test_future_features.py
 tests/test_model_features.py
 tests/test_moe_kernels.py
 tests/test_parallelism.py
+tests/test_production_readiness.py
 tests/test_quantweave.py
 tests/test_run_bundle.py
 tests/test_schedules_and_diagnostics.py

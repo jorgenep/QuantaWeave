@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Training run viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  --bg:#EEF1F4; --panel:#FFFFFF; --ink:#1C2430; --muted:#5E6B7C; --grid:#D5DBE3;
+  --train:#2F5DA8; --val:#C4861B; --accent:#7A4FB0; --live:#2E8B57;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#161B24; --panel:#1F2632; --ink:#E6EAF0; --muted:#94A0B2; --grid:#303a4a;
+    --train:#7FA6E8; --val:#E8B04A; --accent:#B394E0; --live:#5FC98A;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#161B24; --panel:#1F2632; --ink:#E6EAF0; --muted:#94A0B2; --grid:#303a4a;
+  --train:#7FA6E8; --val:#E8B04A; --accent:#B394E0; --live:#5FC98A;
+}
+*,*::before,*::after{box-sizing:inherit}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:Manrope,system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums;line-height:1.45}
+main{max-width:1200px;margin:0 auto;padding:24px 20px 48px}
+header{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between;margin-bottom:20px}
+h1{font-size:1.6rem;font-weight:800;margin:0;letter-spacing:-.01em}
+.sub{color:var(--muted);margin:4px 0 0;font-size:.95rem}
+.controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:.9rem}
+button,.filebtn{font:inherit;font-weight:600;border:1px solid var(--grid);background:var(--panel);color:var(--ink);
+  padding:8px 14px;border-radius:8px;cursor:pointer}
+button:focus-visible,.filebtn:focus-within,input:focus-visible{outline:2px solid var(--train);outline-offset:2px}
+.filebtn input{position:absolute;opacity:0;width:1px;height:1px}
+label{display:inline-flex;gap:6px;align-items:center}
+.stats{display:flex;flex-wrap:wrap;gap:28px;margin:0 0 20px;padding:0}
+.stats div{min-width:110px}
+.stats dt{color:var(--muted);font-size:.82rem}
+.stats dd{margin:2px 0 0;font-size:1.35rem;font-weight:800}
+.hero{background:var(--panel);border-radius:14px;padding:18px 18px 10px;margin-bottom:18px}
+.hero .box{position:relative;height:clamp(280px,48vh,460px)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.card{background:var(--panel);border-radius:10px;padding:12px 14px 8px}
+.card h2,.hero h2{font-size:.95rem;font-weight:600;margin:0 0 6px}
+.card .box{position:relative;height:190px}
+.card .last{color:var(--muted);font-weight:400;float:right}
+.config{color:var(--muted);font-size:.85rem;margin-top:18px}
+#drop{border:2px dashed var(--grid);border-radius:14px;padding:48px 20px;text-align:center;background:var(--panel)}
+#drop.over{border-color:var(--train)}
+#drop textarea{width:100%;max-width:640px;height:120px;margin-top:16px;font:inherit;font-size:.85rem;
+  background:var(--bg);color:var(--ink);border:1px solid var(--grid);border-radius:8px;padding:10px}
+.err{color:#C0392B;font-weight:600}
+.tabs{display:flex;gap:4px;margin-bottom:14px}
+.tabbtn{font:inherit;font-weight:600;font-size:.95rem;border:none;background:transparent;color:var(--muted);
+  padding:8px 4px;cursor:pointer;border-bottom:2px solid transparent}
+.tabbtn.active{color:var(--ink);border-bottom-color:var(--train)}
+.tabbtn:focus-visible{outline:2px solid var(--train);outline-offset:2px}
+.live-badge{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:.85rem}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--live);animation:pulse 1.6s ease-in-out infinite}
+.live-dot.stale{background:var(--muted);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <nav class="tabs">
+    <button class="tabbtn active" id="tabBtnTraining" data-tab="training">Training</button>
+    <button class="tabbtn" id="tabBtnSystem" data-tab="system">System</button>
+  </nav>
+
+  <div id="tabTraining">
+    <header>
+      <div>
+        <h1>Training run viewer</h1>
+        <p class="sub" id="sub">Loading live metrics&hellip;</p>
+      </div>
+      <div class="controls" id="controls" hidden>
+        <span class="live-badge"><span class="live-dot" id="liveDot"></span><span id="liveText">live</span></span>
+        <label>Run <select id="runSelect"><option value="">auto (active run)</option></select></label>
+        <label>Poll <select id="pollRate">
+          <option value="1000">1s</option>
+          <option value="2000">2s</option>
+          <option value="5000" selected>5s</option>
+          <option value="10000">10s</option>
+          <option value="30000">30s</option>
+          <option value="60000">60s</option>
+        </select></label>
+        <label>Smoothing <input type="range" id="smooth" min="0" max="0.99" step="0.01" value="0.9"> <span id="smoothVal">0.90</span></label>
+        <label><input type="checkbox" id="logy"> Log loss axis</label>
+        <label class="filebtn">Load another log<input type="file" id="file2" accept=".jsonl,.json,.txt,.log"></label>
+      </div>
+    </header>
+
+    <section id="drop">
+      <p><strong>Drop a .jsonl log here</strong>, choose a file, or paste lines below.</p>
+      <label class="filebtn">Choose file<input type="file" id="file" accept=".jsonl,.json,.txt,.log"></label>
+      <br>
+      <textarea id="paste" placeholder='{"step": 50, "loss": 10.48, "lr": 5.1e-06, ...}'></textarea>
+      <br><button id="pasteBtn">Plot pasted lines</button>
+      <p class="err" id="err"></p>
+    </section>
+
+    <section id="view" hidden>
+      <dl class="stats" id="stats"></dl>
+      <div class="hero">
+        <h2>Loss</h2>
+        <div class="box"><canvas id="lossChart"></canvas></div>
+      </div>
+      <div class="grid" id="grid"></div>
+      <p class="config" id="config"></p>
+    </section>
+  </div>
+
+  <div id="tabSystem" hidden>
+    <div class="controls" style="margin-bottom:16px">
+      <span class="live-badge"><span class="live-dot" id="sysLiveDot"></span><span id="sysLiveText">live</span></span>
+      <label>Poll <select id="sysPollRate">
+        <option value="1000" selected>1s</option>
+        <option value="2000">2s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select></label>
+      <label>History <select id="sysHistory">
+        <option value="120">2 min</option>
+        <option value="300" selected>5 min</option>
+        <option value="900">15 min</option>
+        <option value="1800">30 min</option>
+      </select></label>
+    </div>
+    <dl class="stats" id="sysStats"></dl>
+    <div class="grid" id="sysGrid"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const LABELS = {lr:'Learning rate', grad_norm:'Gradient norm', router_aux:'Router aux loss',
+  overflow_fraction:'Overflow fraction (dropped routes)', tokens_per_second:'Tokens per second',
+  dropped_routes:'Dropped routes', overflow_routes:'Overflow routes', domain_loss:'Domain loss',
+  gpu_power_watts:'GPU power (W)', energy_kwh_cumulative:'Cumulative energy (kWh)',
+  cost_usd_cumulative:'Cumulative electricity cost ($)'};
+const HIDE = new Set(['overflow_routes']); // duplicates dropped_routes in these logs
+let rows = [], charts = [], liveMode = false, pollTimer = null, lastStep = null;
+
+function parse(text){
+  const out = [];
+  for (const line of text.split(/\r?\n/)){
+    const t = line.trim(); if (!t) continue;
+    try { const o = JSON.parse(t); if (typeof o.step === 'number') out.push(o); } catch(e){}
+  }
+  return out.sort((a,b)=>a.step-b.step);
+}
+function ema(pts, a){
+  let s = null, out = [];
+  for (const p of pts){ s = s===null ? p.y : a*s + (1-a)*p.y; out.push({x:p.x,y:s}); }
+  return out;
+}
+const fmt = v => v==null||isNaN(v) ? '–' : Math.abs(v)>=1000 ? Math.round(v).toLocaleString()
+  : Math.abs(v)<0.01 ? v.toExponential(2) : v.toFixed(3);
+
+function load(text){
+  const r = parse(text);
+  if (!r.length){ $('err').textContent = 'No lines with a numeric "step" field were found. Check that each line is a JSON object.'; return; }
+  rows = r; $('err').textContent = '';
+  if (!liveMode) { try { localStorage.setItem('trainlog', text); } catch(e){} }
+  $('drop').hidden = true; $('view').hidden = false; $('controls').hidden = false;
+  render();
+}
+
+function baseOpts(yTitle){
+  const grid = css('--grid'), muted = css('--muted');
+  return {animation:false, responsive:true, maintainAspectRatio:false, parsing:false, normalized:true,
+    interaction:{mode:'nearest', axis:'x', intersect:false},
+    plugins:{legend:{display:false}, decimation:{enabled:true, algorithm:'lttb', samples:600},
+      tooltip:{callbacks:{title:i=>'Step '+i[0].parsed.x.toLocaleString(), label:c=>' '+c.dataset.label+': '+fmt(c.parsed.y)}}},
+    scales:{x:{type:'linear', grid:{color:grid}, ticks:{color:muted, maxTicksLimit:8}},
+            y:{grid:{color:grid}, ticks:{color:muted, callback:v=>fmt(v)}, title:{display:!!yTitle,text:yTitle,color:muted}}}};
+}
+
+function render(){
+  charts.forEach(c=>c.destroy()); charts = [];
+  const a = +$('smooth').value; $('smoothVal').textContent = a.toFixed(2);
+  const series = k => rows.filter(r=>typeof r[k]==='number').map(r=>({x:r.step,y:r[k]}));
+  const train = series('loss'), val = series('val_loss');
+  const trainS = ema(train, a);
+  const last = rows[rows.length-1];
+
+  // summary
+  const best = val.reduce((b,p)=>!b||p.y<b.y?p:b, null);
+  const tps = series('tokens_per_second');
+  const ovf = series('overflow_fraction');
+  const cost = series('cost_usd_cumulative');
+  const energy = series('energy_kwh_cumulative');
+  const mean = s => s.length ? s.reduce((t,p)=>t+p.y,0)/s.length : NaN;
+  const stats = [
+    ['Latest step', last.step.toLocaleString()],
+    ['Train loss (smoothed)', fmt(trainS.at(-1)?.y)],
+    ['Latest val loss', fmt(val.at(-1)?.y)],
+    ['Best val loss', best ? fmt(best.y)+' @ '+best.x.toLocaleString() : '–'],
+    ['Avg tokens/s', fmt(mean(tps))],
+    ['Avg overflow', ovf.length ? (mean(ovf)*100).toFixed(1)+'%' : '–'],
+    ...(cost.length ? [['Cost so far', '$'+cost.at(-1).y.toFixed(2)]] : []),
+    ...(energy.length ? [['Energy so far', energy.at(-1).y.toFixed(2)+' kWh']] : []),
+  ];
+  $('stats').innerHTML = stats.map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+  $('sub').textContent = `${rows.length.toLocaleString()} logged points, steps ${rows[0].step.toLocaleString()}–${last.step.toLocaleString()}`;
+
+  // loss chart
+  const tr = css('--train'), vl = css('--val');
+  const o = baseOpts();
+  o.plugins.legend = {display:true, labels:{color:css('--muted'), boxWidth:12}};
+  o.scales.y.type = $('logy').checked ? 'logarithmic' : 'linear';
+  charts.push(new Chart($('lossChart'), {type:'line', options:o, data:{datasets:[
+    {label:'Train (raw)', data:train, borderColor:tr+'33', borderWidth:1, pointRadius:0},
+    {label:'Train (smoothed)', data:trainS, borderColor:tr, borderWidth:2, pointRadius:0},
+    {label:'Validation', data:val, borderColor:vl, backgroundColor:vl, borderWidth:2, pointRadius:4, showLine:true},
+  ]}}));
+
+  // other numeric metrics: chart the ones that vary, list constants
+  const keys = [...new Set(rows.flatMap(Object.keys))].filter(k=>!['step','loss','val_loss'].includes(k) && !HIDE.has(k));
+  const varying = [], constant = [];
+  for (const k of keys){
+    const s = series(k); if (!s.length) continue;
+    const mn = Math.min(...s.map(p=>p.y)), mx = Math.max(...s.map(p=>p.y));
+    (mx===mn ? constant : varying).push([k,s,mx]);
+  }
+  const order = ['lr','grad_norm','router_aux','overflow_fraction','tokens_per_second','dropped_routes'];
+  varying.sort((p,q)=>((order.indexOf(p[0])+99)%99)-((order.indexOf(q[0])+99)%99));
+  const acc = css('--accent');
+  $('grid').innerHTML = varying.map(([k],i)=>`<div class="card"><h2>${LABELS[k]||k}<span class="last" id="l${i}"></span></h2><div class="box"><canvas id="c${i}"></canvas></div></div>`).join('');
+  varying.forEach(([k,s],i)=>{
+    const smooth = k!=='lr';
+    $('l'+i).textContent = 'latest '+fmt(s.at(-1).y);
+    const ds = smooth
+      ? [{label:k+' (raw)', data:s, borderColor:acc+'33', borderWidth:1, pointRadius:0},
+         {label:k, data:ema(s,a), borderColor:acc, borderWidth:2, pointRadius:0}]
+      : [{label:k, data:s, borderColor:acc, borderWidth:2, pointRadius:0}];
+    charts.push(new Chart($('c'+i), {type:'line', options:baseOpts(), data:{datasets:ds}}));
+  });
+  $('config').textContent = constant.length ? 'Unchanged through the run: ' + constant.map(([k,s])=>`${k} = ${s[0].y}`).join(', ') : '';
+}
+
+function readFile(f){ if (f) f.text().then(load); }
+$('file').onchange = e => readFile(e.target.files[0]);
+$('file2').onchange = e => readFile(e.target.files[0]);
+$('pasteBtn').onclick = () => load($('paste').value);
+$('smooth').oninput = render;
+$('logy').onchange = render;
+const drop = $('drop');
+['dragover','dragenter'].forEach(ev=>document.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
+['dragleave','drop'].forEach(ev=>document.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over');}));
+document.addEventListener('drop', e => readFile(e.dataTransfer.files[0]));
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>rows.length&&render());
+
+// --- live mode: poll same-origin /metrics.jsonl on an interval, run picker + adjustable rate ---
+let selectedRun = '';               // '' = auto-follow whichever run has the freshest metrics file
+let pollMs = 5000;
+try { pollMs = +(localStorage.getItem('pollMs')) || 5000; } catch(e){}
+try { selectedRun = localStorage.getItem('selectedRun') || ''; } catch(e){}
+
+function metricsUrl(){
+  return 'metrics.jsonl' + (selectedRun ? '?run=' + encodeURIComponent(selectedRun) : '');
+}
+
+async function refreshRunList(){
+  try {
+    const res = await fetch('api/runs', {cache:'no-store'});
+    if (!res.ok) return;
+    const runs = await res.json();
+    const sel = $('runSelect');
+    const current = sel.value;
+    const opts = ['<option value="">auto (active run)</option>']
+      .concat(runs.map(r => `<option value="${r.name}">${r.name}${r === runs[0] ? ' · most recent' : ''}</option>`));
+    if (sel.innerHTML !== opts.join('')) sel.innerHTML = opts.join('');
+    sel.value = current || selectedRun || '';
+  } catch (e) { /* run list is a nicety; ignore transient failures */ }
+}
+
+async function pollOnce(){
+  try {
+    const res = await fetch(metricsUrl(), {cache:'no-store'});
+    if (!res.ok) throw new Error('HTTP '+res.status);
+    const text = await res.text();
+    load(text);
+    $('liveDot').classList.remove('stale');
+    $('liveText').textContent = 'live · updated ' + new Date().toLocaleTimeString();
+    lastStep = rows.length ? rows[rows.length-1].step : lastStep;
+  } catch (e) {
+    $('liveDot').classList.add('stale');
+    $('liveText').textContent = 'connection lost, retrying…';
+  }
+  refreshRunList();
+}
+
+function restartPolling(){
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollOnce, pollMs);
+}
+
+async function tryLive(){
+  try {
+    const res = await fetch(metricsUrl(), {cache:'no-store'});
+    if (!res.ok) return false;
+    const text = await res.text();
+    if (!parse(text).length) return false;
+    liveMode = true;
+    load(text);
+    $('liveDot').classList.remove('stale');
+    $('liveText').textContent = 'live · updated ' + new Date().toLocaleTimeString();
+    restartPolling();
+    return true;
+  } catch (e) { return false; }
+}
+
+$('pollRate').value = String(pollMs);
+$('pollRate').onchange = e => {
+  pollMs = +e.target.value;
+  try { localStorage.setItem('pollMs', String(pollMs)); } catch(err){}
+  if (liveMode) restartPolling();
+};
+$('runSelect').onchange = e => {
+  selectedRun = e.target.value;
+  try { localStorage.setItem('selectedRun', selectedRun); } catch(err){}
+  pollOnce();
+};
+
+(async () => {
+  await refreshRunList();
+  $('runSelect').value = selectedRun;
+  const isLive = await tryLive();
+  if (!isLive) {
+    try { const saved = localStorage.getItem('trainlog'); if (saved) load(saved); } catch(e){}
+  }
+})();
+
+// --- tabs ---
+document.querySelectorAll('.tabbtn').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b === btn));
+  $('tabTraining').hidden = btn.dataset.tab !== 'training';
+  $('tabSystem').hidden = btn.dataset.tab !== 'system';
+  if (btn.dataset.tab === 'system') startSystemPolling();
+});
+
+// --- system telemetry: live-only, kept as an in-memory rolling window (nothing is stored on disk) ---
+const sysHistory = {t:[]}; // t = sample index used as x-axis; each metric appended in-place
+let sysCharts = {}, sysPollTimer = null, sysMaxPoints = 300, sysPollMs = 1000, sysStarted = false;
+
+function pushSeries(obj, key, x, y){ (obj[key] = obj[key] || []).push({x, y}); if (obj[key].length > sysMaxPoints) obj[key].shift(); }
+const bytesFmt = b => b==null ? '–' : b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : (b/1e6).toFixed(0)+' MB';
+const pctFmt = p => p==null ? '–' : p.toFixed(1)+'%';
+// like fmt(), but without forcing 3 decimals on mid-size numbers (percentages, temps, RPM) --
+// "20.000" reads like "20,000" at a glance in a chart axis; this gives "20" or "99.6" instead.
+const fmtSys = v => v==null||isNaN(v) ? '–' : Math.abs(v)>=1000 ? Math.round(v).toLocaleString()
+  : Math.abs(v)<0.01 ? v.toExponential(2) : (Math.round(v*10)/10).toString();
+
+function sysBaseOpts(){
+  const grid = css('--grid'), muted = css('--muted');
+  return {animation:false, responsive:true, maintainAspectRatio:false, parsing:false, normalized:true,
+    interaction:{mode:'nearest', axis:'x', intersect:false},
+    plugins:{legend:{display:true, labels:{color:muted, boxWidth:12, font:{size:11}}},
+      tooltip:{callbacks:{label:c=>' '+c.dataset.label+': '+fmtSys(c.parsed.y)}}},
+    scales:{x:{type:'linear', display:false},
+            y:{grid:{color:grid}, ticks:{color:muted, callback:v=>fmtSys(v)}, beginAtZero:true}}};
+}
+
+function ensureSysChart(id, seriesSpecs){
+  if (sysCharts[id]) return sysCharts[id];
+  const acc = css('--accent'), tr = css('--train'), vl = css('--val'), live = css('--live');
+  const palette = [tr, vl, acc, live, '#C0392B'];
+  const o = sysBaseOpts();
+  const chart = new Chart($(id), {type:'line', options:o, data:{datasets:seriesSpecs.map((s,i)=>(
+    {label:s.label, data:[], borderColor:palette[i%palette.length], borderWidth:2, pointRadius:0}))}});
+  sysCharts[id] = chart;
+  return chart;
+}
+
+let sysTick = 0;
+async function pollSystemOnce(){
+  try {
+    const res = await fetch('api/system', {cache:'no-store'});
+    if (!res.ok) throw new Error('HTTP '+res.status);
+    const s = await res.json();
+    $('sysLiveDot').classList.remove('stale');
+    $('sysLiveText').textContent = 'live · updated ' + new Date().toLocaleTimeString();
+    sysTick++;
+    const x = sysTick;
+    const g = sysHistory;
+    pushSeries(g, 'cpu', x, s.cpu_percent);
+    pushSeries(g, 'ram_used', x, s.mem.used_bytes);
+    pushSeries(g, 'ram_total', x, s.mem.total_bytes);
+    pushSeries(g, 'swap_used', x, s.mem.swap_used_bytes);
+    for (const [k,v] of Object.entries(s.gpu.engine_util_percent||{})) pushSeries(g, 'eng_'+k, x, v);
+    const TEMP_KEEP = new Set(['pkg','vram','pcie','mctrl']);
+    for (const [k,v] of Object.entries(s.gpu.temps_c||{})) if (TEMP_KEEP.has(k)) pushSeries(g, 'temp_'+k, x, v);
+    for (const [k,v] of Object.entries(s.gpu.power_watts||{})) pushSeries(g, 'pow_'+k, x, v);
+    if (s.gpu.vram && s.gpu.vram.total_bytes){
+      pushSeries(g, 'vram_used', x, s.gpu.vram.total_bytes - s.gpu.vram.free_bytes);
+      pushSeries(g, 'vram_total', x, s.gpu.vram.total_bytes);
+    }
+
+    // stat tiles
+    const vram = s.gpu.vram || {};
+    const vramUsed = vram.total_bytes!=null ? vram.total_bytes - vram.free_bytes : null;
+    const tiles = [
+      ['CPU', pctFmt(s.cpu_percent)],
+      ['System RAM', bytesFmt(s.mem.used_bytes) + ' / ' + bytesFmt(s.mem.total_bytes)],
+      ['Swap', bytesFmt(s.mem.swap_used_bytes) + ' / ' + bytesFmt(s.mem.swap_total_bytes)],
+      ['GPU', s.gpu.name || '–'],
+      ['GPU clock', s.gpu.clock || '–'],
+      ['GPU fan', s.gpu.fan_rpm!=null ? s.gpu.fan_rpm+' RPM' : '–'],
+      ['GPU temp (pkg)', s.gpu.temps_c && s.gpu.temps_c.pkg!=null ? s.gpu.temps_c.pkg.toFixed(0)+'°C' : '–'],
+      ['GPU compute (ccs)', pctFmt((s.gpu.engine_util_percent||{}).ccs)],
+      ['VRAM', vramUsed!=null ? bytesFmt(vramUsed)+' / '+bytesFmt(vram.total_bytes) : '–'],
+      ['GPU power (card)', (s.gpu.power_watts||{}).card!=null ? s.gpu.power_watts.card.toFixed(0)+' W' : '–'],
+    ];
+    $('sysStats').innerHTML = tiles.map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+
+    // charts
+    const upd = (id, specs) => {
+      const c = ensureSysChart(id, specs);
+      specs.forEach((s,i) => c.data.datasets[i].data = g[s.key] || []);
+      c.update('none');
+    };
+    upd('sysCpuChart', [{key:'cpu', label:'CPU %'}]);
+    upd('sysRamChart', [{key:'ram_used', label:'RAM used (bytes)'}, {key:'swap_used', label:'Swap used (bytes)'}]);
+    upd('sysVramChart', [{key:'vram_used', label:'VRAM used (bytes)'}]);
+    const engineKeys = Object.keys(g).filter(k=>k.startsWith('eng_'));
+    upd('sysEngineChart', engineKeys.map(k=>({key:k, label:k.replace('eng_','')})));
+    const tempKeys = Object.keys(g).filter(k=>k.startsWith('temp_'));
+    upd('sysTempChart', tempKeys.map(k=>({key:k, label:k.replace('temp_','')})));
+    const powKeys = Object.keys(g).filter(k=>k.startsWith('pow_'));
+    upd('sysPowerChart', powKeys.map(k=>({key:k, label:k.replace('pow_','')})));
+  } catch (e) {
+    $('sysLiveDot').classList.add('stale');
+    $('sysLiveText').textContent = 'connection lost, retrying…';
+  }
+}
+
+function restartSystemPolling(){
+  if (sysPollTimer) clearInterval(sysPollTimer);
+  sysPollTimer = setInterval(pollSystemOnce, sysPollMs);
+}
+
+function startSystemPolling(){
+  if (sysStarted) return;
+  sysStarted = true;
+  $('sysGrid').innerHTML = [
+    ['sysCpuChart','CPU usage'], ['sysRamChart','System RAM / swap'], ['sysVramChart','VRAM used'],
+    ['sysEngineChart','GPU engine utilization'], ['sysTempChart','GPU temperatures (°C)'], ['sysPowerChart','GPU power draw (W)'],
+  ].map(([id,title])=>`<div class="card"><h2>${title}</h2><div class="box"><canvas id="${id}"></canvas></div></div>`).join('');
+  try { sysPollMs = +(localStorage.getItem('sysPollMs')) || 1000; } catch(e){}
+  try { sysMaxPoints = +(localStorage.getItem('sysMaxPoints')) || 300; } catch(e){}
+  $('sysPollRate').value = String(sysPollMs);
+  $('sysHistory').value = String(sysMaxPoints);
+  pollSystemOnce();
+  restartSystemPolling();
+}
+
+$('sysPollRate').onchange = e => {
+  sysPollMs = +e.target.value;
+  try { localStorage.setItem('sysPollMs', String(sysPollMs)); } catch(err){}
+  restartSystemPolling();
+};
+$('sysHistory').onchange = e => {
+  sysMaxPoints = +e.target.value;
+  try { localStorage.setItem('sysMaxPoints', String(sysMaxPoints)); } catch(err){}
+};
+</script>
+</body>
+</html>

@@ -62,6 +62,36 @@ GB** — RTX 4060/4060 Ti 8 GB, RTX 3070; **12 GB** — RTX 3060 12 GB, RTX 4070
 4080 mobile; **24 GB** — RTX 3090, RTX 4090; **32 GB** — RTX 5090, Intel Arc Pro B70, AMD Radeon RX 9800 series; **40
 GB** — A100 40 GB; **80 GB** — A100/H100 80 GB.
 
+### Intel XPU (Arc / Battlemage) caveats
+
+The 32 GB row above was verified for real on an **Intel Arc Pro B70** (32 GB, `xe` kernel driver, Level-Zero
+runtime) — but getting a stable multi-day run out of it took finding two things this driver stack gets wrong
+that the row's numbers alone don't warn you about:
+
+- **`--auto-batch-size` / `hardware.py --probe` are not safe on this hardware.** Their batch-doubling search
+  relies on device OOM raising a clean, catchable exception (true on CUDA). On this `xe` driver, device OOM
+  instead crashes the kernel driver — GPU page faults logged to `dmesg`, the process hangs for 5+ minutes, and
+  the GPU needs the process killed to recover (it does recover; nothing needed a reboot for OOM alone). Size the
+  architecture by hand from the table above and confirm it with a short, wall-clock-capped run (a plain `timeout`
+  around a few hundred steps) instead of the auto-probe.
+- **Host system RAM, not GPU VRAM, is usually the real ceiling.** This driver's memory model stages a meaningful
+  amount of a large model's weights and optimizer state through host RAM, not just device VRAM — so a model sized
+  to comfortably fit the *card's* memory can still thrash the *host's*. On a 22 GB-RAM box, an MoE around 1.0–1.2 B
+  total parameters ran with zero swap and full speed; pushing toward 1.4 B+ (still well inside the GPU's 32 GB)
+  put the process into heavy swapping and cut real throughput by 4–10×. If a run's swap usage climbs steadily
+  rather than settling, that's this, not a leak — the fix is a smaller `--total-experts`, not more patience.
+  (Extra swap space, e.g. a swapfile on a secondary drive, raises the ceiling before it thrashes but doesn't
+  remove the underlying host-RAM cost.)
+- Two optional accelerations are **CUDA-only** on this codebase and silently fall back to the portable path
+  instead of erroring: `--moe-kernel triton` (the Triton grouped-GEMM kernel; `moe_kernels.py`'s
+  `set_moe_kernel` raises if you force it) and `fast_decode.py`'s CUDA-graph decode capture (gated on
+  `device.type == "cuda"`, so XPU always decodes in eager mode). Neither is a training blocker — the default
+  `loop` MoE kernel and eager decode both work correctly on XPU — but don't expect either speedup here.
+
+Measured on that B70: a 1.03 B-total / 133 M-active MoE (28 experts, hidden 640, 14 layers, batch 16, sequence
+512) held ~11,000–15,000 tokens/sec at zero swap once the host-RAM ceiling above was respected, versus real
+config crashes or 4–10× slowdowns above it. See `benchmark-report-b70.md` for the full measured breakdown.
+
 Ready-to-run command for any row (fill in the tier's numbers and let the probe pick the batch size):
 
 ```bash

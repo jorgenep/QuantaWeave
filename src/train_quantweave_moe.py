@@ -386,6 +386,12 @@ def build_parser() -> argparse.ArgumentParser:
     io.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     io.add_argument("--allow-config-change", action="store_true", help="resume even if the run fingerprint differs")
     io.add_argument("--metrics-file", type=Path, help="append JSONL metrics here")
+    io.add_argument("--electricity-rate-usd-kwh", type=float, default=0.16,
+                     help="$/kWh used to estimate cost_usd_cumulative in the metrics log (0.16 is a rough US "
+                          "average placeholder -- set this to your actual rate). Cost tracking needs the GPU "
+                          "driver to expose a hwmon 'card' energy sensor (confirmed present for this box's xe "
+                          "driver); on hosts without one, the cost/power fields are simply omitted.")
+    io.add_argument("--no-power-tracking", action="store_true", help="skip GPU power/cost tracking entirely")
     io.add_argument("--log-interval", type=int, default=1)
     io.add_argument("--diagnostics-dir", type=Path, help="write routing_log.jsonl and SVG heatmaps here")
     io.add_argument("--diagnostics-interval", type=int, default=0, help="steps between routing snapshots (0 = off unless a controller needs them)")
@@ -661,6 +667,11 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
             token_classes(tokenizer), args.diagnostics_dir,
         )
     logger = MetricsLogger(args.metrics_file if is_main else None, counts["total"], counts["active"])
+    power_tracker = None
+    if is_main and not args.no_power_tracking:
+        from energy_tracking import PowerCostTracker
+
+        power_tracker = PowerCostTracker(args.electricity_rate_usd_kwh, resume_from=args.metrics_file)
 
     fields = resume_fields(args, config, dataset, tokenizer, world_size)
     if ctx is not None:
@@ -820,6 +831,7 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
                 grad_norm=float(grad_norm) if grad_norm is not None else None, **applied,
                 **({"time_imbalance": device_metrics["time_imbalance"], "rows_imbalance": device_metrics["rows_imbalance"]} if device_metrics else {}),
                 **({"val_loss": fresh_val_loss} if fresh_val_loss is not None else {}),
+                **(power_tracker.sample() if power_tracker is not None else {}),
             )
             pending_tokens = 0
             say(
@@ -849,6 +861,8 @@ def _run_training(args, original_outputs: tuple, temporary_paths: list) -> dict:
         last_routing=monitor.snapshots[-1] if monitor is not None and monitor.snapshots else None,
         stream=stream.state(args.steps), last_log=last_log, val_loss=val_loss, best_val_loss=best_val_loss,
         val_windows=len(val_dataset) if val_dataset is not None else None,
+        energy_kwh_total=power_tracker.energy_kwh if power_tracker is not None else None,
+        cost_usd_total=(power_tracker.energy_kwh * args.electricity_rate_usd_kwh) if power_tracker is not None else None,
     )
     if archiving:
         from run_bundle import create_run_bundle, reproduce_command
